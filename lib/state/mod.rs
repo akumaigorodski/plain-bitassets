@@ -1,8 +1,11 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, HashMap, HashSet},
+};
 
 use fallible_iterator::FallibleIterator as _;
 use futures::Stream;
-use heed::types::SerdeBincode;
+use heed::{BoxedError, BytesDecode, BytesEncode, types::SerdeBincode};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use sneed::{DatabaseUnique, RoDatabaseUnique, RoTxn, RwTxn, UnitKey};
@@ -35,6 +38,7 @@ pub use error::Error;
 use rollback::{HeightStamped, RollBack};
 
 pub const WITHDRAWAL_BUNDLE_FAILURE_GAP: u32 = 4;
+const ADDRESS_OUTPOINT_KEY_SIZE: usize = 20 + 37;
 
 /// Prevalidated block data containing computed values from validation
 /// to avoid redundant computation during connection
@@ -68,6 +72,99 @@ type WithdrawalBundlesDb = DatabaseUnique<
     )>,
 >;
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct UtxoEntry {
+    pub created_height: u32,
+    pub output: FilledOutput,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SpentUtxoEntry {
+    pub created_height: u32,
+    pub spent_output: SpentOutput,
+}
+
+/// Key for address-indexed UTXO lookups.
+///
+/// Bytes are laid out as address || outpoint, so all UTXOs for an address are
+/// contiguous in LMDB key order.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct AddressOutPointKey([u8; ADDRESS_OUTPOINT_KEY_SIZE]);
+
+impl AddressOutPointKey {
+    pub fn new(address: Address, outpoint: OutPointKey) -> Self {
+        let mut bytes = [0u8; ADDRESS_OUTPOINT_KEY_SIZE];
+        bytes[..20].copy_from_slice(&address.0);
+        bytes[20..].copy_from_slice(outpoint.as_bytes());
+        Self(bytes)
+    }
+
+    fn start(address: Address) -> Self {
+        let mut bytes = [0u8; ADDRESS_OUTPOINT_KEY_SIZE];
+        bytes[..20].copy_from_slice(&address.0);
+        Self(bytes)
+    }
+
+    fn end(address: Address) -> Self {
+        let mut bytes = [0xffu8; ADDRESS_OUTPOINT_KEY_SIZE];
+        bytes[..20].copy_from_slice(&address.0);
+        Self(bytes)
+    }
+
+    pub fn address(&self) -> Address {
+        let mut address = [0u8; 20];
+        address.copy_from_slice(&self.0[..20]);
+        Address(address)
+    }
+
+    pub fn outpoint_key(&self) -> OutPointKey {
+        <OutPointKey as BytesDecode>::bytes_decode(&self.0[20..])
+            .expect("AddressOutPointKey should contain a valid OutPointKey")
+    }
+}
+
+impl Ord for AddressOutPointKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.cmp(&other.0)
+    }
+}
+
+impl PartialOrd for AddressOutPointKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl AsRef<[u8]> for AddressOutPointKey {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl<'a> BytesEncode<'a> for AddressOutPointKey {
+    type EItem = AddressOutPointKey;
+
+    fn bytes_encode(
+        item: &'a Self::EItem,
+    ) -> Result<Cow<'a, [u8]>, BoxedError> {
+        Ok(Cow::Borrowed(item.as_ref()))
+    }
+}
+
+impl<'a> BytesDecode<'a> for AddressOutPointKey {
+    type DItem = AddressOutPointKey;
+
+    fn bytes_decode(bytes: &'a [u8]) -> Result<Self::DItem, BoxedError> {
+        if bytes.len() != ADDRESS_OUTPOINT_KEY_SIZE {
+            return Err("AddressOutPointKey has invalid length".into());
+        }
+        <OutPointKey as BytesDecode>::bytes_decode(&bytes[20..])?;
+        let mut key = [0u8; ADDRESS_OUTPOINT_KEY_SIZE];
+        key.copy_from_slice(bytes);
+        Ok(Self(key))
+    }
+}
+
 #[derive(Clone)]
 pub struct State {
     /// Current tip
@@ -80,7 +177,9 @@ pub struct State {
     /// Associates Dutch auction sequence numbers with auction state
     dutch_auctions: dutch_auction::Db,
     utxos: DatabaseUnique<OutPointKey, SerdeBincode<FilledOutput>>,
-    stxos: DatabaseUnique<OutPointKey, SerdeBincode<SpentOutput>>,
+    utxos_by_address:
+        DatabaseUnique<AddressOutPointKey, SerdeBincode<UtxoEntry>>,
+    stxos: DatabaseUnique<OutPointKey, SerdeBincode<SpentUtxoEntry>>,
     /// Pending withdrawal bundle. MUST exist in withdrawal_bundles
     pending_withdrawal_bundle: DatabaseUnique<UnitKey, SerdeBincode<M6id>>,
     /// Latest failed (known) withdrawal bundle
@@ -104,7 +203,7 @@ pub struct State {
 }
 
 impl State {
-    pub const NUM_DBS: u32 = bitassets::Dbs::NUM_DBS + 12;
+    pub const NUM_DBS: u32 = bitassets::Dbs::NUM_DBS + 14;
 
     pub fn new(env: &sneed::Env) -> Result<Self, Error> {
         let mut rwtxn = env.write_txn()?;
@@ -115,6 +214,8 @@ impl State {
         let dutch_auctions =
             DatabaseUnique::create(env, &mut rwtxn, "dutch_auctions")?;
         let utxos = DatabaseUnique::create(env, &mut rwtxn, "utxos")?;
+        let utxos_by_address =
+            DatabaseUnique::create(env, &mut rwtxn, "utxos_by_address")?;
         let stxos = DatabaseUnique::create(env, &mut rwtxn, "stxos")?;
         let pending_withdrawal_bundle = DatabaseUnique::create(
             env,
@@ -139,6 +240,23 @@ impl State {
         if version.try_get(&rwtxn, &())?.is_none() {
             version.put(&mut rwtxn, &(), &*VERSION)?;
         }
+        let utxos_by_address_is_empty =
+            utxos_by_address.iter(&rwtxn)?.next()?.is_none();
+        if utxos_by_address_is_empty {
+            let utxos_snapshot: Vec<_> = utxos
+                .iter(&rwtxn)?
+                .map(|(outpoint_key, output)| Ok((outpoint_key, output)))
+                .collect()?;
+            for (outpoint_key, output) in utxos_snapshot {
+                let entry = UtxoEntry {
+                    created_height: 0,
+                    output,
+                };
+                let address_key =
+                    AddressOutPointKey::new(entry.output.address, outpoint_key);
+                utxos_by_address.put(&mut rwtxn, &address_key, &entry)?;
+            }
+        }
         rwtxn.commit()?;
         Ok(Self {
             tip,
@@ -147,6 +265,7 @@ impl State {
             bitassets,
             dutch_auctions,
             utxos,
+            utxos_by_address,
             stxos,
             pending_withdrawal_bundle,
             latest_failed_withdrawal_bundle,
@@ -180,7 +299,7 @@ impl State {
 
     pub fn stxos(
         &self,
-    ) -> &RoDatabaseUnique<OutPointKey, SerdeBincode<SpentOutput>> {
+    ) -> &RoDatabaseUnique<OutPointKey, SerdeBincode<SpentUtxoEntry>> {
         &self.stxos
     }
 
@@ -206,6 +325,102 @@ impl State {
         Ok(height)
     }
 
+    fn put_utxo(
+        &self,
+        rwtxn: &mut RwTxn,
+        outpoint_key: &OutPointKey,
+        output: &FilledOutput,
+        created_height: u32,
+    ) -> Result<(), sneed::db::Error> {
+        if let Some(old_output) = self.utxos.try_get(rwtxn, outpoint_key)? {
+            let old_address_key =
+                AddressOutPointKey::new(old_output.address, *outpoint_key);
+            self.utxos_by_address.delete(rwtxn, &old_address_key)?;
+        }
+        let entry = UtxoEntry {
+            created_height,
+            output: output.clone(),
+        };
+        let address_key =
+            AddressOutPointKey::new(output.address, *outpoint_key);
+        self.utxos.put(rwtxn, outpoint_key, output)?;
+        self.utxos_by_address.put(rwtxn, &address_key, &entry)?;
+        Ok(())
+    }
+
+    fn get_utxo_entry(
+        &self,
+        rotxn: &RoTxn,
+        outpoint_key: &OutPointKey,
+    ) -> Result<Option<UtxoEntry>, sneed::db::Error> {
+        let Some(output) = self.utxos.try_get(rotxn, outpoint_key)? else {
+            return Ok(None);
+        };
+        let address_key =
+            AddressOutPointKey::new(output.address, *outpoint_key);
+        let entry = self
+            .utxos_by_address
+            .try_get(rotxn, &address_key)?
+            .unwrap_or(UtxoEntry {
+                created_height: 0,
+                output,
+            });
+        Ok(Some(entry))
+    }
+
+    fn delete_utxo(
+        &self,
+        rwtxn: &mut RwTxn,
+        outpoint_key: &OutPointKey,
+    ) -> Result<Option<UtxoEntry>, sneed::db::Error> {
+        let Some(entry) = self.get_utxo_entry(rwtxn, outpoint_key)? else {
+            return Ok(None);
+        };
+        let address_key =
+            AddressOutPointKey::new(entry.output.address, *outpoint_key);
+        self.utxos.delete(rwtxn, outpoint_key)?;
+        self.utxos_by_address.delete(rwtxn, &address_key)?;
+        Ok(Some(entry))
+    }
+
+    fn spend_utxo(
+        &self,
+        rwtxn: &mut RwTxn,
+        outpoint_key: &OutPointKey,
+        inpoint: InPoint,
+    ) -> Result<Option<SpentUtxoEntry>, sneed::db::Error> {
+        let Some(entry) = self.delete_utxo(rwtxn, outpoint_key)? else {
+            return Ok(None);
+        };
+        let spent_entry = SpentUtxoEntry {
+            created_height: entry.created_height,
+            spent_output: SpentOutput {
+                output: entry.output,
+                inpoint,
+            },
+        };
+        self.stxos.put(rwtxn, outpoint_key, &spent_entry)?;
+        Ok(Some(spent_entry))
+    }
+
+    fn unspend_utxo(
+        &self,
+        rwtxn: &mut RwTxn,
+        outpoint_key: &OutPointKey,
+    ) -> Result<Option<SpentUtxoEntry>, sneed::db::Error> {
+        let Some(entry) = self.stxos.try_get(rwtxn, outpoint_key)? else {
+            return Ok(None);
+        };
+        self.stxos.delete(rwtxn, outpoint_key)?;
+        self.put_utxo(
+            rwtxn,
+            outpoint_key,
+            &entry.spent_output.output,
+            entry.created_height,
+        )?;
+        Ok(Some(entry))
+    }
+
     pub fn get_utxos(
         &self,
         rotxn: &RoTxn,
@@ -223,12 +438,19 @@ impl State {
         rotxn: &RoTxn,
         addresses: &HashSet<Address>,
     ) -> Result<HashMap<OutPoint, FilledOutput>, Error> {
-        let utxos: HashMap<OutPoint, FilledOutput> = self
-            .utxos
-            .iter(rotxn)?
-            .filter(|(_, output)| Ok(addresses.contains(&output.address)))
-            .map(|(key, output)| Ok((key.to_outpoint(), output)))
-            .collect()?;
+        let mut utxos = HashMap::new();
+        for address in addresses {
+            let start = AddressOutPointKey::start(*address);
+            let end = AddressOutPointKey::end(*address);
+            let mut iter = self
+                .utxos_by_address
+                .range(rotxn, &(start..=end))
+                .map_err(sneed::db::Error::from)?;
+            while let Some((key, entry)) = iter.next()? {
+                let outpoint = key.outpoint_key().to_outpoint();
+                utxos.insert(outpoint, entry.output);
+            }
+        }
         Ok(utxos)
     }
 
@@ -300,13 +522,13 @@ impl State {
                 .try_get(rotxn, &key)?
                 .ok_or(Error::NoStxo { outpoint: *input })?;
             assert_eq!(
-                stxo.inpoint,
+                stxo.spent_output.inpoint,
                 InPoint::Regular {
                     txid,
                     vin: vin as u32
                 }
             );
-            spent_utxos.push(stxo.output);
+            spent_utxos.push(stxo.spent_output.output);
         }
         spent_utxos.reverse();
         Ok(FilledTransaction {
@@ -656,7 +878,8 @@ impl State {
         let mut total_deposit_stxo_value = bitcoin::Amount::ZERO;
         let mut total_withdrawal_stxo_value = bitcoin::Amount::ZERO;
         self.stxos.iter(rotxn)?.map_err(Error::from).for_each(
-            |(outpoint_key, spent_output)| {
+            |(outpoint_key, spent_entry)| {
+                let spent_output = spent_entry.spent_output;
                 let outpoint = outpoint_key.to_outpoint();
                 if let OutPoint::Deposit(_) = outpoint {
                     total_deposit_stxo_value = total_deposit_stxo_value
@@ -759,5 +982,273 @@ impl Watchable<()> for State {
     /// Get a signal that notifies whenever the tip changes
     fn watch(&self) -> Self::WatchStream {
         tokio_stream::wrappers::WatchStream::new(self.tip.watch().clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::HashSet,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use crate::types::{
+        BitcoinOutputContent, FilledOutputContent, MerkleRoot, Output,
+    };
+
+    use super::*;
+
+    struct TestDir(PathBuf);
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            drop(std::fs::remove_dir_all(&self.0));
+        }
+    }
+
+    struct TestEnv {
+        env: sneed::Env,
+        _dir: TestDir,
+    }
+
+    fn test_env() -> anyhow::Result<TestEnv> {
+        let mut path = std::env::temp_dir();
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        path.push(format!(
+            "plain-bitassets-state-utxo-test-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path)?;
+
+        let mut env_open_opts = heed::EnvOpenOptions::new();
+        env_open_opts
+            .map_size(16 * 1024 * 1024)
+            .max_dbs(State::NUM_DBS);
+        let env = unsafe { sneed::Env::open(&env_open_opts, &path) }?;
+        Ok(TestEnv {
+            env,
+            _dir: TestDir(path),
+        })
+    }
+
+    fn outpoint(tag: u8, vout: u32) -> OutPoint {
+        OutPoint::Coinbase {
+            merkle_root: MerkleRoot::from([tag; 32]),
+            vout,
+        }
+    }
+
+    fn filled_output(address: Address, sats: u64) -> FilledOutput {
+        Output::new(
+            address,
+            FilledOutputContent::Bitcoin(BitcoinOutputContent(
+                bitcoin::Amount::from_sat(sats),
+            )),
+        )
+    }
+
+    #[test]
+    fn address_outpoint_key_round_trips_components() {
+        let address = Address([7; 20]);
+        let outpoint = outpoint(1, 2);
+        let outpoint_key = OutPointKey::from_outpoint(&outpoint);
+        let key = AddressOutPointKey::new(address, outpoint_key);
+
+        assert_eq!(key.address(), address);
+        assert_eq!(key.outpoint_key(), outpoint_key);
+    }
+
+    #[test]
+    fn query_utxos_by_addresses_uses_address_ranges() -> anyhow::Result<()> {
+        let test_env = test_env()?;
+        let state = State::new(&test_env.env)?;
+        let address_a = Address([1; 20]);
+        let address_b = Address([2; 20]);
+        let address_c = Address([3; 20]);
+
+        let outpoint_a0 = outpoint(10, 0);
+        let outpoint_a1 = outpoint(11, 0);
+        let outpoint_b0 = outpoint(12, 0);
+        let output_a0 = filled_output(address_a, 100);
+        let output_a1 = filled_output(address_a, 101);
+        let output_b0 = filled_output(address_b, 200);
+
+        let mut rwtxn = test_env.env.write_txn()?;
+        state.put_utxo(
+            &mut rwtxn,
+            &OutPointKey::from_outpoint(&outpoint_a0),
+            &output_a0,
+            4,
+        )?;
+        state.put_utxo(
+            &mut rwtxn,
+            &OutPointKey::from_outpoint(&outpoint_a1),
+            &output_a1,
+            5,
+        )?;
+        state.put_utxo(
+            &mut rwtxn,
+            &OutPointKey::from_outpoint(&outpoint_b0),
+            &output_b0,
+            6,
+        )?;
+        rwtxn.commit()?;
+
+        let rotxn = test_env.env.read_txn()?;
+        let addresses = HashSet::from([address_a, address_c]);
+        let utxos = state.get_utxos_by_addresses(&rotxn, &addresses)?;
+
+        assert_eq!(utxos.len(), 2);
+        assert_eq!(utxos.get(&outpoint_a0), Some(&output_a0));
+        assert_eq!(utxos.get(&outpoint_a1), Some(&output_a1));
+        assert!(!utxos.contains_key(&outpoint_b0));
+
+        Ok(())
+    }
+
+    #[test]
+    fn utxo_helpers_keep_indexes_in_sync() -> anyhow::Result<()> {
+        let test_env = test_env()?;
+        let state = State::new(&test_env.env)?;
+        let address_a = Address([4; 20]);
+        let address_b = Address([5; 20]);
+        let outpoint = outpoint(20, 0);
+        let outpoint_key = OutPointKey::from_outpoint(&outpoint);
+        let output_a = filled_output(address_a, 300);
+        let output_b = filled_output(address_b, 301);
+        let address_key_a = AddressOutPointKey::new(address_a, outpoint_key);
+        let address_key_b = AddressOutPointKey::new(address_b, outpoint_key);
+
+        let mut rwtxn = test_env.env.write_txn()?;
+        state.put_utxo(&mut rwtxn, &outpoint_key, &output_a, 7)?;
+        state.put_utxo(&mut rwtxn, &outpoint_key, &output_b, 8)?;
+
+        assert!(
+            state
+                .utxos_by_address
+                .try_get(&rwtxn, &address_key_a)?
+                .is_none()
+        );
+        assert_eq!(
+            state.utxos.try_get(&rwtxn, &outpoint_key)?,
+            Some(output_b.clone())
+        );
+        assert_eq!(
+            state.utxos_by_address.try_get(&rwtxn, &address_key_b)?,
+            Some(UtxoEntry {
+                created_height: 8,
+                output: output_b.clone(),
+            })
+        );
+
+        let deleted = state.delete_utxo(&mut rwtxn, &outpoint_key)?;
+        assert_eq!(
+            deleted,
+            Some(UtxoEntry {
+                created_height: 8,
+                output: output_b,
+            })
+        );
+        assert!(state.utxos.try_get(&rwtxn, &outpoint_key)?.is_none());
+        assert!(
+            state
+                .utxos_by_address
+                .try_get(&rwtxn, &address_key_b)?
+                .is_none()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn spend_and_unspend_preserve_created_height() -> anyhow::Result<()> {
+        let test_env = test_env()?;
+        let state = State::new(&test_env.env)?;
+        let address = Address([6; 20]);
+        let outpoint = outpoint(30, 0);
+        let outpoint_key = OutPointKey::from_outpoint(&outpoint);
+        let address_key = AddressOutPointKey::new(address, outpoint_key);
+        let output = filled_output(address, 400);
+
+        let mut rwtxn = test_env.env.write_txn()?;
+        state.put_utxo(&mut rwtxn, &outpoint_key, &output, 42)?;
+        let inpoint = InPoint::Regular {
+            txid: Default::default(),
+            vin: 0,
+        };
+        let spent = state.spend_utxo(&mut rwtxn, &outpoint_key, inpoint)?;
+        assert_eq!(
+            spent,
+            Some(SpentUtxoEntry {
+                created_height: 42,
+                spent_output: SpentOutput {
+                    output: output.clone(),
+                    inpoint,
+                },
+            })
+        );
+        assert!(state.utxos.try_get(&rwtxn, &outpoint_key)?.is_none());
+        assert!(
+            state
+                .utxos_by_address
+                .try_get(&rwtxn, &address_key)?
+                .is_none()
+        );
+
+        let unspent = state.unspend_utxo(&mut rwtxn, &outpoint_key)?;
+        assert_eq!(
+            unspent,
+            Some(SpentUtxoEntry {
+                created_height: 42,
+                spent_output: SpentOutput {
+                    output: output.clone(),
+                    inpoint,
+                },
+            })
+        );
+        assert_eq!(
+            state.utxos_by_address.try_get(&rwtxn, &address_key)?,
+            Some(UtxoEntry {
+                created_height: 42,
+                output: output.clone(),
+            })
+        );
+        assert!(state.stxos.try_get(&rwtxn, &outpoint_key)?.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn state_new_backfills_address_index() -> anyhow::Result<()> {
+        let test_env = test_env()?;
+        let state = State::new(&test_env.env)?;
+        let address = Address([8; 20]);
+        let outpoint = outpoint(40, 0);
+        let outpoint_key = OutPointKey::from_outpoint(&outpoint);
+        let output = filled_output(address, 500);
+
+        let mut rwtxn = test_env.env.write_txn()?;
+        state.utxos.put(&mut rwtxn, &outpoint_key, &output)?;
+        rwtxn.commit()?;
+
+        let state = State::new(&test_env.env)?;
+        let rotxn = test_env.env.read_txn()?;
+        let utxos =
+            state.get_utxos_by_addresses(&rotxn, &HashSet::from([address]))?;
+
+        assert_eq!(utxos.get(&outpoint), Some(&output));
+        assert_eq!(
+            state.utxos_by_address.try_get(
+                &rotxn,
+                &AddressOutPointKey::new(address, outpoint_key)
+            )?,
+            Some(UtxoEntry {
+                created_height: 0,
+                output,
+            })
+        );
+
+        Ok(())
     }
 }

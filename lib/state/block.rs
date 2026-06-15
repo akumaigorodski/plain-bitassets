@@ -208,7 +208,6 @@ pub fn connect_prevalidated(
         + body.coinbase.len();
 
     // Use Vec + sort_unstable instead of individual DB operations for better performance
-    let mut utxo_deletes: Vec<OutPointKey> = Vec::with_capacity(total_inputs);
     let mut stxo_puts: Vec<(OutPointKey, SpentOutput)> =
         Vec::with_capacity(total_inputs);
     let mut utxo_puts: Vec<(OutPointKey, FilledOutput)> =
@@ -263,7 +262,6 @@ pub fn connect_prevalidated(
                     vin: vin as u32,
                 },
             };
-            utxo_deletes.push(key);
             stxo_puts.push((key, spent_output));
         }
 
@@ -358,21 +356,23 @@ pub fn connect_prevalidated(
     }
 
     // Sort all vectors in parallel for optimal cursor access
-    utxo_deletes.par_sort_unstable();
     stxo_puts.par_sort_unstable_by_key(|(key, _)| *key);
     utxo_puts.par_sort_unstable_by_key(|(key, _)| *key);
 
     // Apply all database operations using pre-sorted keys for optimal B-tree access
-    for key in &utxo_deletes {
-        state.utxos.delete(rwtxn, key)?;
-    }
-
     for (key, spent_output) in &stxo_puts {
-        state.stxos.put(rwtxn, key, spent_output)?;
+        let Some(entry) = state.spend_utxo(rwtxn, key, spent_output.inpoint)?
+        else {
+            return Err(error::NoUtxo {
+                outpoint: key.to_outpoint(),
+            }
+            .into());
+        };
+        debug_assert_eq!(&entry.spent_output, spent_output);
     }
 
     for (key, filled_output) in &utxo_puts {
-        state.utxos.put(rwtxn, key, filled_output)?;
+        state.put_utxo(rwtxn, key, filled_output, prevalidated.next_height)?;
     }
 
     // Update tip and height using precomputed values
@@ -433,26 +433,23 @@ pub fn connect(
             content: filled_content,
             memo: output.memo.clone(),
         };
-        state.utxos.put(rwtxn, &outpoint_key, &filled_output)?;
+        state.put_utxo(rwtxn, &outpoint_key, &filled_output, height)?;
     }
     for transaction in &body.transactions {
         let filled_tx = state.fill_transaction(rwtxn, transaction)?;
         let txid = filled_tx.txid();
         for (vin, input) in filled_tx.inputs().iter().enumerate() {
             let input_key = OutPointKey::from_outpoint(input);
-            let spent_output = state
-                .utxos
-                .try_get(rwtxn, &input_key)?
+            state
+                .spend_utxo(
+                    rwtxn,
+                    &input_key,
+                    InPoint::Regular {
+                        txid,
+                        vin: vin as u32,
+                    },
+                )?
                 .ok_or(error::NoUtxo { outpoint: *input })?;
-            let spent_output = SpentOutput {
-                output: spent_output,
-                inpoint: InPoint::Regular {
-                    txid,
-                    vin: vin as u32,
-                },
-            };
-            state.utxos.delete(rwtxn, &input_key)?;
-            state.stxos.put(rwtxn, &input_key, &spent_output)?;
         }
         let Some(filled_outputs) = filled_tx.filled_outputs() else {
             let err = error::FillTxOutputContents(Box::new(filled_tx));
@@ -464,7 +461,7 @@ pub fn connect(
                 vout: vout as u32,
             };
             let outpoint_key = OutPointKey::from_outpoint(&outpoint);
-            state.utxos.put(rwtxn, &outpoint_key, filled_output)?;
+            state.put_utxo(rwtxn, &outpoint_key, filled_output, height)?;
         }
         match &transaction.data {
             None => (),
@@ -652,7 +649,7 @@ pub fn disconnect_tip(
                     vout: vout as u32,
                 };
                 let outpoint_key = OutPointKey::from_outpoint(&outpoint);
-                if state.utxos.delete(rwtxn, &outpoint_key)? {
+                if state.delete_utxo(rwtxn, &outpoint_key)?.is_some() {
                     Ok::<_, Error>(())
                 } else {
                     Err(error::NoUtxo { outpoint }.into())
@@ -662,13 +659,7 @@ pub fn disconnect_tip(
         // unspend STXOs, last-to-first
         tx.inputs.iter().rev().try_for_each(|outpoint| {
             let outpoint_key = OutPointKey::from_outpoint(outpoint);
-            if let Some(spent_output) =
-                state.stxos.try_get(rwtxn, &outpoint_key)?
-            {
-                state.stxos.delete(rwtxn, &outpoint_key)?;
-                state
-                    .utxos
-                    .put(rwtxn, &outpoint_key, &spent_output.output)?;
+            if state.unspend_utxo(rwtxn, &outpoint_key)?.is_some() {
                 Ok(())
             } else {
                 Err(Error::NoStxo {
@@ -685,7 +676,7 @@ pub fn disconnect_tip(
                 vout: vout as u32,
             };
             let outpoint_key = OutPointKey::from_outpoint(&outpoint);
-            if state.utxos.delete(rwtxn, &outpoint_key)? {
+            if state.delete_utxo(rwtxn, &outpoint_key)?.is_some() {
                 Ok::<_, Error>(())
             } else {
                 Err(error::NoUtxo { outpoint }.into())

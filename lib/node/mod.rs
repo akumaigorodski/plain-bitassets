@@ -519,7 +519,7 @@ where
                 .try_get(&rotxn, &outpoint_key)
                 .map_err(state::Error::from)?
             {
-                spent.push((*outpoint, output));
+                spent.push((*outpoint, output.spent_output));
             }
         }
         Ok(spent)
