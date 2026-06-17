@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     cmp::Ordering,
     collections::{BTreeMap, HashMap, HashSet},
     path::PathBuf,
@@ -6,7 +7,8 @@ use std::{
 
 use bitcoin::{self, hashes::Hash as _};
 use fallible_iterator::{FallibleIterator, IteratorExt};
-use heed::types::SerdeBincode;
+use heed::{BoxedError, BytesDecode, BytesEncode, types::SerdeBincode};
+use serde::{Deserialize, Serialize};
 use sneed::{
     DatabaseUnique, EnvError, RoTxn, RwTxn, RwTxnError, UnitKey,
     db::{self, error::Error as DbError},
@@ -14,12 +16,102 @@ use sneed::{
 };
 
 use crate::types::{
-    Block, BlockHash, BmmResult, Body, Header, Tip, Txid, VERSION, Version,
+    ADDRESS_SIZE, Address, Block, BlockHash, BmmResult, Body,
+    FilledTransaction, Header, MerkleProof, Tip, Txid, VERSION, Version,
     proto::mainchain,
 };
 
+const TXID_SIZE: usize = blake3::OUT_LEN;
+const TXDB_KEY_SIZE: usize = ADDRESS_SIZE + TXID_SIZE;
+
+/// Fixed-width txdb key: address || txid.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct TxDbKey([u8; TXDB_KEY_SIZE]);
+
+impl TxDbKey {
+    #[inline]
+    pub fn new(address: Address, txid: Txid) -> Self {
+        let mut key = [0u8; TXDB_KEY_SIZE];
+        key[..ADDRESS_SIZE].copy_from_slice(&address.0);
+        key[ADDRESS_SIZE..].copy_from_slice(txid.as_slice());
+        Self(key)
+    }
+
+    #[inline]
+    pub fn start(address: Address) -> Self {
+        let mut key = [0u8; TXDB_KEY_SIZE];
+        key[..ADDRESS_SIZE].copy_from_slice(&address.0);
+        Self(key)
+    }
+
+    #[inline]
+    pub fn end(address: Address) -> Self {
+        let mut key = [0xffu8; TXDB_KEY_SIZE];
+        key[..ADDRESS_SIZE].copy_from_slice(&address.0);
+        Self(key)
+    }
+
+    #[inline]
+    pub fn address(&self) -> Address {
+        let mut address = [0u8; ADDRESS_SIZE];
+        address.copy_from_slice(&self.0[..ADDRESS_SIZE]);
+        Address(address)
+    }
+
+    #[inline]
+    pub fn txid(&self) -> Txid {
+        let mut txid = [0u8; TXID_SIZE];
+        txid.copy_from_slice(&self.0[ADDRESS_SIZE..]);
+        Txid(txid)
+    }
+}
+
+impl AsRef<[u8]> for TxDbKey {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl<'a> BytesEncode<'a> for TxDbKey {
+    type EItem = TxDbKey;
+
+    #[inline]
+    fn bytes_encode(
+        item: &'a Self::EItem,
+    ) -> Result<Cow<'a, [u8]>, BoxedError> {
+        Ok(Cow::Borrowed(item.as_ref()))
+    }
+}
+
+impl<'a> BytesDecode<'a> for TxDbKey {
+    type DItem = TxDbKey;
+
+    #[inline]
+    fn bytes_decode(bytes: &'a [u8]) -> Result<Self::DItem, BoxedError> {
+        if bytes.len() != TXDB_KEY_SIZE {
+            return Err("TxDbKey has wrong length".into());
+        }
+        let mut key = [0u8; TXDB_KEY_SIZE];
+        key.copy_from_slice(bytes);
+        Ok(Self(key))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct TxDbEntry {
+    pub tx: FilledTransaction,
+    pub merkle_proof: MerkleProof,
+    pub block_hash: BlockHash,
+    pub block_height: u32,
+    pub unix_stamp: u64,
+}
+
 #[allow(clippy::duplicated_attributes)]
 #[derive(thiserror::Error, transitive::Transitive, Debug)]
+#[transitive(from(db::error::Delete, DbError))]
+#[transitive(from(db::error::IterInit, DbError))]
+#[transitive(from(db::error::IterItem, DbError))]
 #[transitive(from(db::error::Put, DbError))]
 #[transitive(from(db::error::TryGet, DbError))]
 #[transitive(from(env::error::CreateDb, EnvError))]
@@ -73,6 +165,10 @@ pub enum Error {
     NoMainHeight(bitcoin::BlockHash),
     #[error("no tx with txid {0}")]
     NoTx(Txid),
+    #[error(
+        "txdb filled transaction length mismatch: expected {expected}, actual {actual}"
+    )]
+    TxDbFilledTxLenMismatch { expected: usize, actual: usize },
 }
 
 #[derive(Clone)]
@@ -148,11 +244,13 @@ pub struct Archive {
         SerdeBincode<Txid>,
         SerdeBincode<BTreeMap<BlockHash, u32>>,
     >,
+    /// Capped tx cache, keyed by (address, txid).
+    txdb: DatabaseUnique<TxDbKey, SerdeBincode<TxDbEntry>>,
     _version: DatabaseUnique<UnitKey, SerdeBincode<Version>>,
 }
 
 impl Archive {
-    pub const NUM_DBS: u32 = 14;
+    pub const NUM_DBS: u32 = 15;
 
     pub fn new(env: &sneed::Env) -> Result<Self, Error> {
         let mut rwtxn = env.write_txn()?;
@@ -224,6 +322,7 @@ impl Archive {
         let total_work = DatabaseUnique::create(env, &mut rwtxn, "total_work")?;
         let txid_to_inclusions =
             DatabaseUnique::create(env, &mut rwtxn, "txid_to_inclusions")?;
+        let txdb = DatabaseUnique::create(env, &mut rwtxn, "txdb")?;
         rwtxn.commit()?;
         Ok(Self {
             block_hash_to_height,
@@ -239,6 +338,7 @@ impl Archive {
             successors,
             total_work,
             txid_to_inclusions,
+            txdb,
             _version: version,
         })
     }
@@ -670,6 +770,121 @@ impl Archive {
             .try_get(rotxn, &txid)?
             .unwrap_or_default();
         Ok(inclusions)
+    }
+
+    pub fn get_txdb_entries_by_address(
+        &self,
+        rotxn: &RoTxn,
+        address: Address,
+        height_threshold: u32,
+    ) -> Result<Vec<(TxDbKey, TxDbEntry)>, Error> {
+        let start = TxDbKey::start(address);
+        let end = TxDbKey::end(address);
+        let mut entries = Vec::new();
+        let mut iter = self
+            .txdb
+            .range(rotxn, &(start..=end))
+            .map_err(DbError::from)?;
+        while let Some((key, entry)) = iter.next().map_err(DbError::from)? {
+            if entry.block_height >= height_threshold {
+                entries.push((key, entry));
+            }
+        }
+        Ok(entries)
+    }
+
+    pub fn put_txdb_for_connected_block(
+        &self,
+        rwtxn: &mut RwTxn,
+        block_hash: BlockHash,
+        block_height: u32,
+        body: &Body,
+        filled_txs: &[FilledTransaction],
+        unix_stamp: u64,
+    ) -> Result<(), Error> {
+        if body.transactions.len() != filled_txs.len() {
+            return Err(Error::TxDbFilledTxLenMismatch {
+                expected: body.transactions.len(),
+                actual: filled_txs.len(),
+            });
+        }
+        for (tx_index, filled_tx) in filled_txs.iter().enumerate() {
+            let txid = filled_tx.txid();
+            debug_assert_eq!(body.transactions[tx_index].txid(), txid);
+            let merkle_proof = Body::compute_tx_merkle_proof(
+                &body.coinbase,
+                &body.transactions,
+                tx_index,
+            );
+            debug_assert_eq!(merkle_proof.leaf_index, tx_index + 1);
+
+            let mut addresses = HashSet::new();
+            addresses.extend(
+                filled_tx.spent_utxos.iter().map(|output| output.address),
+            );
+            addresses.extend(
+                filled_tx
+                    .transaction
+                    .outputs
+                    .iter()
+                    .map(|output| output.address),
+            );
+
+            for address in addresses {
+                let key = TxDbKey::new(address, txid);
+                let entry = TxDbEntry {
+                    tx: filled_tx.clone(),
+                    merkle_proof: merkle_proof.clone(),
+                    block_hash,
+                    block_height,
+                    unix_stamp,
+                };
+                self.txdb.put(rwtxn, &key, &entry)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn prune_txdb_older_than(
+        &self,
+        rwtxn: &mut RwTxn,
+        cutoff_unix: u64,
+    ) -> Result<usize, Error> {
+        let keys = {
+            let mut keys = Vec::new();
+            let mut iter = self.txdb.iter(rwtxn).map_err(DbError::from)?;
+            while let Some((key, entry)) = iter.next().map_err(DbError::from)? {
+                if entry.unix_stamp < cutoff_unix {
+                    keys.push(key);
+                }
+            }
+            keys
+        };
+        for key in &keys {
+            let _ = self.txdb.delete(rwtxn, key)?;
+        }
+        Ok(keys.len())
+    }
+
+    pub fn prune_txdb_block(
+        &self,
+        rwtxn: &mut RwTxn,
+        block_hash: BlockHash,
+    ) -> Result<usize, Error> {
+        let keys = {
+            let mut keys = Vec::new();
+            let mut iter = self.txdb.iter(rwtxn).map_err(DbError::from)?;
+            while let Some((key, entry)) = iter.next().map_err(DbError::from)? {
+                if entry.block_hash == block_hash {
+                    keys.push(key);
+                }
+            }
+            keys
+        };
+        for key in &keys {
+            let _ = self.txdb.delete(rwtxn, key)?;
+        }
+        Ok(keys.len())
     }
 
     /// Store a block body. The header must already exist.
