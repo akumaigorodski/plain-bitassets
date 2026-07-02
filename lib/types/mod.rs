@@ -20,6 +20,7 @@ pub mod keys;
 pub mod proto;
 pub mod schema;
 pub mod transaction;
+pub mod utreexo;
 
 pub use address::{ADDRESS_SIZE, Address};
 pub use bitasset_data::{BitAssetData, BitAssetDataUpdates, Update};
@@ -35,6 +36,10 @@ pub use transaction::{
     DutchAuctionParams, FilledOutput, FilledOutputContent, FilledTransaction,
     InPoint, OutPoint, OutPointKey, Output, OutputContent, PointedOutput,
     SpentOutput, Transaction, TxData, TxInputs, WithdrawalOutputContent,
+};
+pub use utreexo::{
+    Accumulator, AccumulatorDiff, AccumulatorStump, UtreexoHash, UtreexoProof,
+    leaf_hash as utreexo_leaf_hash,
 };
 
 pub const THIS_SIDECHAIN: u8 = 4;
@@ -163,6 +168,9 @@ pub struct Header {
     #[borsh(serialize_with = "borsh_serialize_bitcoin_block_hash")]
     #[schema(value_type = crate::types::schema::BitcoinBlockHash)]
     pub prev_main_hash: bitcoin::BlockHash,
+    /// Post-state Utreexo accumulator roots. Full nodes recompute these from
+    /// their local UTXO set; transactions do not carry Utreexo proofs.
+    pub roots: Vec<UtreexoHash>,
 }
 
 impl Header {

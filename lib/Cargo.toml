@@ -46,6 +46,7 @@ quinn = { workspace = true }
 rayon = { workspace = true }
 rcgen = { workspace = true }
 rustls = { workspace = true, features = ["ring"] }
+rustreexo = { workspace = true, features = ["with-serde"] }
 semver = { workspace = true, features = ["serde"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

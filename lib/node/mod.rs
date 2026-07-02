@@ -24,11 +24,11 @@ use crate::{
     },
     types::{
         Address, AmountOverflowError, AmountUnderflowError, AssetId,
-        Authorized, AuthorizedTransaction, BitAssetData, BitAssetId, Block,
-        BlockHash, BmmResult, Body, DutchAuctionId, FilledOutput,
-        FilledTransaction, GetBitcoinValue, Header, InPoint, Network, OutPoint,
-        OutPointKey, Output, SpentOutput, Tip, Transaction, TxIn, Txid,
-        WithdrawalBundle,
+        Authorization, Authorized, AuthorizedTransaction, BitAssetData,
+        BitAssetId, Block, BlockHash, BmmResult, Body, DutchAuctionId,
+        FilledOutput, FilledTransaction, GetBitcoinValue, Header, InPoint,
+        Network, OutPoint, OutPointKey, Output, SpentOutput, Tip, Transaction,
+        TxIn, Txid, UtreexoHash, Verify as _, WithdrawalBundle,
         proto::{self, mainchain},
     },
     util::Watchable,
@@ -41,6 +41,75 @@ use mainchain_task::MainchainTaskHandle;
 use net_task::NetTaskHandle;
 #[cfg(feature = "zmq")]
 use net_task::ZmqPubHandler;
+
+fn restore_accumulator_from_archive(
+    env: &sneed::Env,
+    archive: &Archive,
+    state: &State,
+) -> Result<(), Error> {
+    fn check_roots(
+        archive: &Archive,
+        state: &State,
+        rotxn: &sneed::RoTxn,
+        tip: BlockHash,
+    ) -> Result<(), Error> {
+        let computed = state.accumulator_roots()?;
+        let expected = archive.get_header(rotxn, tip)?.roots;
+        if computed != expected {
+            return Err(state::Error::InvalidUtreexoRoots {
+                expected,
+                computed,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    let mut rwtxn = env.write_txn().map_err(EnvError::from)?;
+    let Some(tip) = state.try_get_tip(&rwtxn)? else {
+        state.delete_accumulator(&mut rwtxn)?;
+        rwtxn.commit().map_err(RwTxnError::from)?;
+        return Ok(());
+    };
+    let Some((snapshot_hash, _snapshot_height, accumulator)) =
+        archive.latest_accumulator_snapshot(&rwtxn, tip)?
+    else {
+        state.rebuild_accumulator_from_utxos(&mut rwtxn)?;
+        check_roots(archive, state, &rwtxn, tip)?;
+        rwtxn.commit().map_err(RwTxnError::from)?;
+        return Ok(());
+    };
+    if snapshot_hash == tip {
+        state.set_accumulator(&mut rwtxn, accumulator)?;
+        check_roots(archive, state, &rwtxn, tip)?;
+        rwtxn.commit().map_err(RwTxnError::from)?;
+        return Ok(());
+    }
+    state.set_accumulator(&mut rwtxn, accumulator)?;
+    let mut replay_blocks: Vec<_> = archive
+        .ancestors(&rwtxn, tip)
+        .take_while(|block_hash| Ok(*block_hash != snapshot_hash))
+        .collect()?;
+    replay_blocks.reverse();
+    for block_hash in replay_blocks {
+        let header = archive.get_header(&rwtxn, block_hash)?;
+        let body = archive.get_body(&rwtxn, block_hash)?;
+        let diff = state.accumulator_diff_for_connected_body(
+            &rwtxn,
+            header.merkle_root,
+            &body,
+        )?;
+        state.apply_accumulator_diff(&mut rwtxn, &diff)?;
+        if let Some(peg_diff) =
+            archive.try_get_peg_accumulator_diff(&rwtxn, block_hash)?
+        {
+            state.apply_accumulator_diff(&mut rwtxn, &peg_diff)?;
+        }
+        check_roots(archive, state, &rwtxn, block_hash)?;
+    }
+    rwtxn.commit().map_err(RwTxnError::from)?;
+    Ok(())
+}
 
 #[allow(clippy::duplicated_attributes)]
 #[derive(thiserror::Error, transitive::Transitive, Debug)]
@@ -84,8 +153,6 @@ pub enum Error {
     SendMainchainTaskRequest,
     #[error("state error")]
     State(#[source] Box<state::Error>),
-    #[error("Utreexo error: {0}")]
-    Utreexo(String),
     #[error("Verify BMM error")]
     VerifyBmm(anyhow::Error),
     #[cfg(feature = "zmq")]
@@ -194,6 +261,7 @@ where
         #[cfg(feature = "zmq")]
         let zmq_pub_handler = Arc::new(ZmqPubHandler::new(zmq_addr).await?);
         let archive = Archive::new(&env)?;
+        restore_accumulator_from_archive(&env, &archive, &state)?;
         let mempool = MemPool::new(&env)?;
         let (mainchain_task, mainchain_task_response_rx) =
             MainchainTaskHandle::new(
@@ -479,7 +547,18 @@ where
     ) -> Result<(), Error> {
         {
             let mut rotxn = self.env.write_txn()?;
-            self.state.validate_transaction(&rotxn, &transaction)?;
+            match self
+                .state
+                .validate_transaction(&rotxn, &transaction)
+                .map(|_| ())
+            {
+                Ok(()) => (),
+                Err(state::Error::NoUtxo { .. }) => {
+                    Authorization::verify_transaction(&transaction)
+                        .map_err(state::Error::Authorization)?;
+                }
+                Err(err) => return Err(err.into()),
+            }
             self.mempool.put(&mut rotxn, &transaction)?;
             rotxn.commit().map_err(RwTxnError::from)?;
         }
@@ -624,6 +703,39 @@ where
         Ok(self.archive.get_body(&rotxn, block_hash)?)
     }
 
+    pub fn utreexo_roots_after_block(
+        &self,
+        prev_side_hash: Option<BlockHash>,
+        prev_main_hash: bitcoin::BlockHash,
+        body: &Body,
+        two_way_peg_data: &mainchain::TwoWayPegData,
+    ) -> Result<Vec<UtreexoHash>, Error> {
+        let mut rwtxn = self.env.write_txn()?;
+        let merkle_root =
+            Body::compute_merkle_root(&body.coinbase, &body.transactions);
+        let header = Header {
+            merkle_root,
+            prev_side_hash,
+            prev_main_hash,
+            roots: Vec::new(),
+        };
+        let prevalidated =
+            self.state.prevalidate_block(&rwtxn, &header, body)?;
+        self.state.connect_prevalidated_block(
+            &mut rwtxn,
+            &header,
+            body,
+            &prevalidated,
+        )?;
+        let peg_diff = self
+            .state
+            .connect_two_way_peg_data(&mut rwtxn, two_way_peg_data)?;
+        Ok(self.state.accumulator_roots_after_diffs([
+            &prevalidated.accumulator_diff,
+            &peg_diff,
+        ])?)
+    }
+
     pub fn get_best_main_verification(
         &self,
         hash: BlockHash,
@@ -688,14 +800,14 @@ where
                     .delete(&mut rwtxn, transaction.transaction.txid())?;
                 continue;
             }
-            if self
-                .state
-                .validate_transaction(&rwtxn, &transaction)
-                .is_err()
-            {
-                self.mempool
-                    .delete(&mut rwtxn, transaction.transaction.txid())?;
-                continue;
+            match self.state.validate_transaction(&rwtxn, &transaction) {
+                Ok(_) => (),
+                Err(state::Error::NoUtxo { .. }) => continue,
+                Err(_) => {
+                    self.mempool
+                        .delete(&mut rwtxn, transaction.transaction.txid())?;
+                    continue;
+                }
             }
             let filled_transaction = self
                 .state

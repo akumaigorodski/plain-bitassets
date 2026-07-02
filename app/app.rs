@@ -415,6 +415,17 @@ impl App {
         } else {
             None
         };
+        let two_way_peg_data = {
+            let start_main_hash = prev_side_hash
+                .map(|block_hash| self.node.get_header(block_hash))
+                .transpose()?
+                .map(|header| header.prev_main_hash);
+            let mut miner_write = miner.write().await;
+            miner_write
+                .cusf_mainchain
+                .get_two_way_peg_data(start_main_hash, prev_main_hash)
+                .await?
+        };
         let (bribe, header, body) = if prev_side_hash == tip_hash {
             const NUM_TRANSACTIONS: usize = 1000;
             let (txs, tx_fees) =
@@ -438,10 +449,17 @@ impl App {
                 txs.into_iter().map(|tx| tx.into()).collect(),
                 coinbase,
             );
+            let roots = self.node.utreexo_roots_after_block(
+                prev_side_hash,
+                prev_main_hash,
+                &body,
+                &two_way_peg_data,
+            )?;
             let header = types::Header {
                 merkle_root,
                 prev_side_hash,
                 prev_main_hash,
+                roots,
             };
             let bribe = fee.unwrap_or_else(|| {
                 if tx_fees > bitcoin::Amount::ZERO {
@@ -455,10 +473,17 @@ impl App {
             let coinbase = Vec::new();
             let merkle_root = Body::compute_merkle_root(&coinbase, &[]);
             let body = Body::new(Vec::new(), coinbase);
+            let roots = self.node.utreexo_roots_after_block(
+                prev_side_hash,
+                prev_main_hash,
+                &body,
+                &two_way_peg_data,
+            )?;
             let header = types::Header {
                 merkle_root,
                 prev_side_hash,
                 prev_main_hash,
+                roots,
             };
             let bribe = Self::EMPTY_BLOCK_BMM_BRIBE;
             (bribe, header, body)

@@ -16,7 +16,7 @@ use plain_bitassets::{
         DutchAuctionId, DutchAuctionParams, EncryptionPubKey,
         FilledOutputContent, Header, MerkleRoot, OutPoint, Output,
         OutputContent, PointedOutput, Transaction, TxData, TxIn, Txid,
-        VerifyingKey, WithdrawalBundle, WithdrawalOutputContent,
+        UtreexoHash, VerifyingKey, WithdrawalBundle, WithdrawalOutputContent,
         schema as bitassets_schema,
     },
     wallet::Balance,
@@ -43,7 +43,7 @@ pub struct TxInfo {
     BlockHash, Body, DutchAuctionId, DutchAuctionParams, EncryptionPubKey,
     FilledOutputContent, Header, MerkleRoot, OutPoint, Output, OutputContent,
     PeerConnectionStatus, Signature, Transaction, TxData, Txid, TxIn,
-    WithdrawalOutputContent, VerifyingKey,
+    UtreexoHash, WithdrawalOutputContent, VerifyingKey,
 ])]
 #[rpc(client, server)]
 pub trait Rpc {

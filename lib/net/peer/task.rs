@@ -23,8 +23,10 @@ use crate::{
         message::{self, Heartbeat, RequestMessage, ResponseMessage},
         request_queue,
     },
+    state,
     types::{
-        AuthorizedTransaction, BlockHash, BmmResult, Header, Tip, VERSION,
+        Authorization, AuthorizedTransaction, BlockHash, BmmResult, Header,
+        Tip, VERSION, Verify as _,
     },
     util::join_set,
 };
@@ -657,9 +659,30 @@ impl ConnectionTask {
         let txid = tx.transaction.txid();
         let validate_tx_result = {
             let rotxn = ctxt.env.read_txn().map_err(EnvError::from)?;
-            ctxt.state.validate_transaction(&rotxn, &tx)
+            ctxt.state.validate_transaction(&rotxn, &tx).map(|_| ())
         };
         match validate_tx_result {
+            Err(state::Error::NoUtxo { .. }) => {
+                if let Err(err) = Authorization::verify_transaction(&tx) {
+                    Connection::send_response(
+                        ctxt.network,
+                        response_tx,
+                        ResponseMessage::TransactionRejected(txid),
+                    )
+                    .await?;
+                    return Err(Error::from(state::Error::Authorization(err)));
+                }
+                Connection::send_response(
+                    ctxt.network,
+                    response_tx,
+                    ResponseMessage::TransactionAccepted(txid),
+                )
+                .await?;
+                info_tx
+                    .unbounded_send(Info::NewTransaction(tx))
+                    .map_err(|_| Error::SendInfo)?;
+                Ok(())
+            }
             Err(err) => {
                 Connection::send_response(
                     ctxt.network,

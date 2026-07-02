@@ -34,7 +34,7 @@ use crate::{
     },
     state::{self, State},
     types::{
-        BmmResult, Body, Header, Tip,
+        AccumulatorDiff, BmmResult, Body, Header, Tip,
         proto::{self, mainchain},
     },
     util::join_set,
@@ -138,6 +138,68 @@ fn unix_now() -> u64 {
         .map_or(0, |duration| duration.as_secs())
 }
 
+struct AppliedAccumulatorDiffs<'a> {
+    state: &'a State,
+    diffs: Vec<AccumulatorDiff>,
+}
+
+impl<'a> AppliedAccumulatorDiffs<'a> {
+    fn new(state: &'a State) -> Self {
+        Self {
+            state,
+            diffs: Vec::new(),
+        }
+    }
+
+    fn apply(
+        &mut self,
+        rwtxn: &mut RwTxn<'_>,
+        diff: AccumulatorDiff,
+    ) -> Result<(), Error> {
+        if diff.is_empty() {
+            return Ok(());
+        }
+        self.state.apply_accumulator_diff(rwtxn, &diff)?;
+        self.diffs.push(diff);
+        Ok(())
+    }
+
+    fn committed(&mut self) {
+        self.diffs.clear();
+    }
+
+    fn rollback(&mut self) {
+        for diff in self.diffs.drain(..).rev() {
+            let inverse = diff.into_inverse();
+            if let Err(err) =
+                self.state.apply_accumulator_diff_to_memory(&inverse)
+            {
+                tracing::error!(
+                    ?err,
+                    "failed to roll back staged utreexo accumulator diff"
+                );
+                break;
+            }
+        }
+    }
+}
+
+fn commit_staged_accumulator(
+    rwtxn: RwTxn<'_>,
+    applied_accumulator_diffs: &mut AppliedAccumulatorDiffs<'_>,
+) -> Result<(), Error> {
+    match rwtxn.commit().map_err(RwTxnError::from) {
+        Ok(()) => {
+            applied_accumulator_diffs.committed();
+            Ok(())
+        }
+        Err(err) => {
+            applied_accumulator_diffs.rollback();
+            Err(err.into())
+        }
+    }
+}
+
 fn connect_tip_(
     rwtxn: &mut RwTxn<'_>,
     archive: &Archive,
@@ -146,17 +208,27 @@ fn connect_tip_(
     header: &Header,
     body: &Body,
     two_way_peg_data: &mainchain::TwoWayPegData,
+    applied_accumulator_diffs: &mut AppliedAccumulatorDiffs<'_>,
 ) -> Result<(), Error> {
     let block_hash = header.hash();
     let prevalidated = state.prevalidate_block(rwtxn, header, body)?;
     let block_height = prevalidated.next_height;
     let merkle_root = prevalidated.computed_merkle_root;
-    let filled_txs = prevalidated.filled_transactions.clone();
-    state.connect_prevalidated_block(rwtxn, header, body, prevalidated)?;
+    state.connect_prevalidated_block(rwtxn, header, body, &prevalidated)?;
     if tracing::enabled!(tracing::Level::DEBUG) {
         tracing::debug!(height = block_height, %merkle_root, %block_hash, "connected body")
     }
-    let () = state.connect_two_way_peg_data(rwtxn, two_way_peg_data)?;
+    let peg_accumulator_diff =
+        state.connect_two_way_peg_data(rwtxn, two_way_peg_data)?;
+    state.check_accumulator_roots_after_diffs(
+        &header.roots,
+        [&prevalidated.accumulator_diff, &peg_accumulator_diff],
+    )?;
+    archive.put_peg_accumulator_diff(
+        rwtxn,
+        block_hash,
+        &peg_accumulator_diff,
+    )?;
     let () = archive.put_header(rwtxn, header)?;
     let () = archive.put_body(rwtxn, block_hash, body)?;
     let unix_stamp = unix_now();
@@ -165,7 +237,7 @@ fn connect_tip_(
         block_hash,
         block_height,
         body,
-        &filled_txs,
+        &prevalidated.filled_transactions,
         unix_stamp,
     )?;
     if block_height > 0 && block_height % TXDB_PRUNE_INTERVAL_BLOCKS == 0 {
@@ -173,7 +245,13 @@ fn connect_tip_(
         let _ = archive.prune_txdb_older_than(rwtxn, cutoff_unix)?;
     }
     for transaction in &body.transactions {
-        let () = mempool.delete(rwtxn, transaction.txid())?;
+        let () = mempool.delete_confirmed(rwtxn, transaction.txid())?;
+    }
+    applied_accumulator_diffs.apply(rwtxn, prevalidated.accumulator_diff)?;
+    applied_accumulator_diffs.apply(rwtxn, peg_accumulator_diff)?;
+    if Archive::should_snapshot_accumulator(block_height) {
+        let accumulator_bytes = state.accumulator_bytes()?;
+        archive.put_accumulator_bytes(rwtxn, block_hash, accumulator_bytes)?;
     }
     Ok(())
 }
@@ -183,6 +261,7 @@ fn disconnect_tip_(
     archive: &Archive,
     mempool: &MemPool,
     state: &State,
+    applied_accumulator_diffs: &mut AppliedAccumulatorDiffs<'_>,
 ) -> Result<(), Error> {
     let tip_block_hash =
         state.try_get_tip(rwtxn)?.ok_or(state::Error::NoTip)?;
@@ -270,12 +349,21 @@ fn disconnect_tip_(
             block_info: block_infos.into_iter().rev().collect(),
         }
     };
-    let () = state.disconnect_two_way_peg_data(rwtxn, &two_way_peg_data)?;
+    let body_accumulator_diff = state.accumulator_diff_for_connected_body(
+        rwtxn,
+        tip_header.merkle_root,
+        &tip_body,
+    )?;
+    let peg_accumulator_diff =
+        state.disconnect_two_way_peg_data(rwtxn, &two_way_peg_data)?;
     let _ = archive.prune_txdb_block(rwtxn, tip_block_hash)?;
     let () = state.disconnect_tip(rwtxn, &tip_header, &tip_body)?;
     for transaction in tip_body.authorized_transactions().iter().rev() {
         mempool.put(rwtxn, transaction)?;
     }
+    applied_accumulator_diffs.apply(rwtxn, peg_accumulator_diff)?;
+    applied_accumulator_diffs
+        .apply(rwtxn, body_accumulator_diff.into_inverse())?;
     Ok(())
 }
 
@@ -291,174 +379,190 @@ fn reorg_to_tip(
     #[cfg(feature = "zmq")] zmq_pub_handler: &ZmqPubHandler,
     new_tip: Tip,
 ) -> Result<bool, Error> {
-    let mut rwtxn = env.write_txn().map_err(EnvError::from)?;
-    let tip_height = state.try_get_height(&rwtxn)?;
-    let tip = state
-        .try_get_tip(&rwtxn)?
-        .map(|tip_hash| {
-            let bmm_verification =
-                archive.get_best_main_verification(&rwtxn, tip_hash)?;
-            Ok::<_, Error>(Tip {
-                block_hash: tip_hash,
-                main_block_hash: bmm_verification,
+    let mut applied_accumulator_diffs = AppliedAccumulatorDiffs::new(state);
+    let result = (|| -> Result<bool, Error> {
+        let mut rwtxn = env.write_txn().map_err(EnvError::from)?;
+        let tip_height = state.try_get_height(&rwtxn)?;
+        let tip = state
+            .try_get_tip(&rwtxn)?
+            .map(|tip_hash| {
+                let bmm_verification =
+                    archive.get_best_main_verification(&rwtxn, tip_hash)?;
+                Ok::<_, Error>(Tip {
+                    block_hash: tip_hash,
+                    main_block_hash: bmm_verification,
+                })
             })
-        })
-        .transpose()?;
-    if let Some(tip) = tip {
-        // check that new tip is better than current tip
-        if archive.better_tip(&rwtxn, tip, new_tip)? != Some(new_tip) {
+            .transpose()?;
+        if let Some(tip) = tip {
+            // check that new tip is better than current tip
+            if archive.better_tip(&rwtxn, tip, new_tip)? != Some(new_tip) {
+                tracing::debug!(
+                    ?tip,
+                    ?new_tip,
+                    "New tip is not better than current tip"
+                );
+                return Ok(false);
+            }
+        }
+        let common_ancestor = if let Some(tip) = tip {
+            archive.last_common_ancestor(
+                &rwtxn,
+                tip.block_hash,
+                new_tip.block_hash,
+            )?
+        } else {
+            None
+        };
+        // Check that all necessary bodies exist before disconnecting tip
+        let blocks_to_apply: NonEmpty<(Header, Body)> = {
+            let header = archive.get_header(&rwtxn, new_tip.block_hash)?;
+            let body = archive.get_body(&rwtxn, new_tip.block_hash)?;
+            let ancestors = if let Some(prev_side_hash) = header.prev_side_hash
+            {
+                archive
+                    .ancestors(&rwtxn, prev_side_hash)
+                    .take_while(|block_hash| {
+                        Ok(common_ancestor.is_none_or(|common_ancestor| {
+                            *block_hash != common_ancestor
+                        }))
+                    })
+                    .map(|block_hash| {
+                        let header = archive.get_header(&rwtxn, block_hash)?;
+                        let body = archive.get_body(&rwtxn, block_hash)?;
+                        Ok((header, body))
+                    })
+                    .collect()?
+            } else {
+                Vec::new()
+            };
+            NonEmpty {
+                head: (header, body),
+                tail: ancestors,
+            }
+        };
+        // Disconnect tip until common ancestor is reached
+        let mut common_ancestor_height = None;
+        if let Some(tip_height) = tip_height {
+            if let Some(common_ancestor) = common_ancestor {
+                common_ancestor_height =
+                    Some(archive.get_height(&rwtxn, common_ancestor)?);
+            }
             tracing::debug!(
                 ?tip,
-                ?new_tip,
-                "New tip is not better than current tip"
+                ?tip_height,
+                ?common_ancestor,
+                ?common_ancestor_height,
+                "Disconnecting tip until common ancestor is reached"
             );
-            return Ok(false);
+            let disconnects =
+                if let Some(common_ancestor_height) = common_ancestor_height {
+                    tip_height - common_ancestor_height
+                } else {
+                    tip_height + 1
+                };
+            for _ in 0..disconnects {
+                let () = disconnect_tip_(
+                    &mut rwtxn,
+                    archive,
+                    mempool,
+                    state,
+                    &mut applied_accumulator_diffs,
+                )?;
+            }
         }
-    }
-    let common_ancestor = if let Some(tip) = tip {
-        archive.last_common_ancestor(
-            &rwtxn,
-            tip.block_hash,
-            new_tip.block_hash,
-        )?
-    } else {
-        None
-    };
-    // Check that all necessary bodies exist before disconnecting tip
-    let blocks_to_apply: NonEmpty<(Header, Body)> = {
-        let header = archive.get_header(&rwtxn, new_tip.block_hash)?;
-        let body = archive.get_body(&rwtxn, new_tip.block_hash)?;
-        let ancestors = if let Some(prev_side_hash) = header.prev_side_hash {
+        {
+            let tip_hash = state.try_get_tip(&rwtxn)?;
+            assert_eq!(tip_hash, common_ancestor);
+        }
+        let mut two_way_peg_data_batch: Vec<_> = {
+            let common_ancestor_header =
+                if let Some(common_ancestor) = common_ancestor {
+                    Some(archive.get_header(&rwtxn, common_ancestor)?)
+                } else {
+                    None
+                };
+            let common_ancestor_prev_main_hash =
+                common_ancestor_header.map(|header| header.prev_main_hash);
             archive
-                .ancestors(&rwtxn, prev_side_hash)
-                .take_while(|block_hash| {
-                    Ok(common_ancestor.is_none_or(|common_ancestor| {
-                        *block_hash != common_ancestor
-                    }))
+                .main_ancestors(&rwtxn, blocks_to_apply.head.0.prev_main_hash)
+                .take_while(|ancestor| {
+                    Ok(Some(ancestor)
+                        != common_ancestor_prev_main_hash.as_ref())
                 })
-                .map(|block_hash| {
-                    let header = archive.get_header(&rwtxn, block_hash)?;
-                    let body = archive.get_body(&rwtxn, block_hash)?;
-                    Ok((header, body))
+                .map(|ancestor| {
+                    let block_info =
+                        archive.get_main_block_info(&rwtxn, &ancestor)?;
+                    Ok((ancestor, block_info))
                 })
                 .collect()?
-        } else {
-            Vec::new()
         };
-        NonEmpty {
-            head: (header, body),
-            tail: ancestors,
-        }
-    };
-    // Disconnect tip until common ancestor is reached
-    let mut common_ancestor_height = None;
-    if let Some(tip_height) = tip_height {
-        if let Some(common_ancestor) = common_ancestor {
-            common_ancestor_height =
-                Some(archive.get_height(&rwtxn, common_ancestor)?);
-        }
-        tracing::debug!(
-            ?tip,
-            ?tip_height,
-            ?common_ancestor,
-            ?common_ancestor_height,
-            "Disconnecting tip until common ancestor is reached"
-        );
-        let disconnects =
-            if let Some(common_ancestor_height) = common_ancestor_height {
-                tip_height - common_ancestor_height
-            } else {
-                tip_height + 1
-            };
-        for _ in 0..disconnects {
-            let () = disconnect_tip_(&mut rwtxn, archive, mempool, state)?;
-        }
-    }
-    {
-        let tip_hash = state.try_get_tip(&rwtxn)?;
-        assert_eq!(tip_hash, common_ancestor);
-    }
-    let mut two_way_peg_data_batch: Vec<_> = {
-        let common_ancestor_header =
-            if let Some(common_ancestor) = common_ancestor {
-                Some(archive.get_header(&rwtxn, common_ancestor)?)
-            } else {
-                None
-            };
-        let common_ancestor_prev_main_hash =
-            common_ancestor_header.map(|header| header.prev_main_hash);
-        archive
-            .main_ancestors(&rwtxn, blocks_to_apply.head.0.prev_main_hash)
-            .take_while(|ancestor| {
-                Ok(Some(ancestor) != common_ancestor_prev_main_hash.as_ref())
-            })
-            .map(|ancestor| {
-                let block_info =
-                    archive.get_main_block_info(&rwtxn, &ancestor)?;
-                Ok((ancestor, block_info))
-            })
-            .collect()?
-    };
-    // Apply blocks until new tip is reached
-    for (header, body) in blocks_to_apply.iter().rev() {
-        let two_way_peg_data = {
-            let mut two_way_peg_data = mainchain::TwoWayPegData::default();
-            'fill_2wpd: while let Some((block_hash, block_info)) =
-                two_way_peg_data_batch.pop()
-            {
-                two_way_peg_data.block_info.replace(block_hash, block_info);
-                if block_hash == header.prev_main_hash {
-                    break 'fill_2wpd;
+        // Apply blocks until new tip is reached
+        for (header, body) in blocks_to_apply.iter().rev() {
+            let two_way_peg_data = {
+                let mut two_way_peg_data = mainchain::TwoWayPegData::default();
+                'fill_2wpd: while let Some((block_hash, block_info)) =
+                    two_way_peg_data_batch.pop()
+                {
+                    two_way_peg_data.block_info.replace(block_hash, block_info);
+                    if block_hash == header.prev_main_hash {
+                        break 'fill_2wpd;
+                    }
                 }
+                two_way_peg_data
+            };
+            let () = connect_tip_(
+                &mut rwtxn,
+                archive,
+                mempool,
+                state,
+                header,
+                body,
+                &two_way_peg_data,
+                &mut applied_accumulator_diffs,
+            )?;
+            let new_tip_hash = state.try_get_tip(&rwtxn)?.unwrap();
+            let bmm_verification =
+                archive.get_best_main_verification(&rwtxn, new_tip_hash)?;
+            let new_tip = Tip {
+                block_hash: new_tip_hash,
+                main_block_hash: bmm_verification,
+            };
+            if let Some(tip) = tip
+                && archive.better_tip(&rwtxn, tip, new_tip)? != Some(new_tip)
+            {
+                continue;
             }
-            two_way_peg_data
-        };
-        let () = connect_tip_(
-            &mut rwtxn,
-            archive,
-            mempool,
-            state,
-            header,
-            body,
-            &two_way_peg_data,
-        )?;
-        let new_tip_hash = state.try_get_tip(&rwtxn)?.unwrap();
-        let bmm_verification =
-            archive.get_best_main_verification(&rwtxn, new_tip_hash)?;
-        let new_tip = Tip {
-            block_hash: new_tip_hash,
-            main_block_hash: bmm_verification,
-        };
-        if let Some(tip) = tip
-            && archive.better_tip(&rwtxn, tip, new_tip)? != Some(new_tip)
-        {
-            continue;
+            commit_staged_accumulator(rwtxn, &mut applied_accumulator_diffs)?;
+            tracing::info!("synced to tip: {}", new_tip.block_hash);
+            rwtxn = env.write_txn().map_err(EnvError::from)?;
         }
-        rwtxn.commit().map_err(RwTxnError::from)?;
+        let tip = state.try_get_tip(&rwtxn)?;
+        assert_eq!(tip, Some(new_tip.block_hash));
+        commit_staged_accumulator(rwtxn, &mut applied_accumulator_diffs)?;
         tracing::info!("synced to tip: {}", new_tip.block_hash);
-        rwtxn = env.write_txn().map_err(EnvError::from)?;
-    }
-    let tip = state.try_get_tip(&rwtxn)?;
-    assert_eq!(tip, Some(new_tip.block_hash));
-    rwtxn.commit().map_err(RwTxnError::from)?;
-    tracing::info!("synced to tip: {}", new_tip.block_hash);
-    #[cfg(feature = "zmq")]
-    {
-        for (idx, (header, _body)) in
-            blocks_to_apply.into_iter().rev().enumerate()
+        #[cfg(feature = "zmq")]
         {
-            let block_hash = header.hash();
-            let height =
-                common_ancestor_height.map(|h| h + 1).unwrap_or(0) + idx as u32;
-            let mut zmq_msg = zeromq::ZmqMessage::from("hashblock");
-            zmq_msg.push_back(bytes::Bytes::copy_from_slice(&block_hash.0));
-            zmq_msg.push_back(bytes::Bytes::copy_from_slice(
-                &height.to_le_bytes(),
-            ));
-            zmq_pub_handler.tx.unbounded_send(zmq_msg).unwrap();
+            for (idx, (header, _body)) in
+                blocks_to_apply.into_iter().rev().enumerate()
+            {
+                let block_hash = header.hash();
+                let height = common_ancestor_height.map(|h| h + 1).unwrap_or(0)
+                    + idx as u32;
+                let mut zmq_msg = zeromq::ZmqMessage::from("hashblock");
+                zmq_msg.push_back(bytes::Bytes::copy_from_slice(&block_hash.0));
+                zmq_msg.push_back(bytes::Bytes::copy_from_slice(
+                    &height.to_le_bytes(),
+                ));
+                zmq_pub_handler.tx.unbounded_send(zmq_msg).unwrap();
+            }
         }
+        Ok(true)
+    })();
+    if result.is_err() {
+        applied_accumulator_diffs.rollback();
     }
-    Ok(true)
+    result
 }
 
 #[derive(Clone)]

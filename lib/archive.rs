@@ -15,9 +15,9 @@ use sneed::{
 };
 
 use crate::types::{
-    Address, AddressTxidKey, Block, BlockHash, BmmResult, Body,
-    FilledTransaction, Header, MerkleProof, Tip, Txid, VERSION, Version,
-    proto::mainchain,
+    Accumulator, AccumulatorDiff, Address, AddressTxidKey, Block, BlockHash,
+    BmmResult, Body, FilledTransaction, Header, MerkleProof, Tip, Txid,
+    VERSION, Version, proto::mainchain,
 };
 
 #[allow(clippy::duplicated_attributes)]
@@ -82,6 +82,8 @@ pub enum Error {
         "txdb filled transaction length mismatch: expected {expected}, actual {actual}"
     )]
     TxDbFilledTxLenMismatch { expected: usize, actual: usize },
+    #[error("Utreexo error: {0}")]
+    Utreexo(String),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -95,6 +97,9 @@ pub struct FilledTxEntry {
 
 #[derive(Clone)]
 pub struct Archive {
+    /// Accumulator snapshots by connected block hash, used for reorgs.
+    accumulators:
+        DatabaseUnique<SerdeBincode<BlockHash>, SerdeBincode<Vec<u8>>>,
     block_hash_to_height:
         DatabaseUnique<SerdeBincode<BlockHash>, SerdeBincode<u32>>,
     /// BMM results for each header.
@@ -150,6 +155,9 @@ pub struct Archive {
         SerdeBincode<bitcoin::BlockHash>,
         SerdeBincode<HashSet<bitcoin::BlockHash>>,
     >,
+    /// Two-way-peg accumulator diffs by connected sidechain block hash.
+    peg_accumulator_diffs:
+        DatabaseUnique<SerdeBincode<BlockHash>, SerdeBincode<AccumulatorDiff>>,
     /// Successor blocks. ALL known block hashes MUST be present.
     successors: DatabaseUnique<
         SerdeBincode<Option<BlockHash>>,
@@ -172,7 +180,8 @@ pub struct Archive {
 }
 
 impl Archive {
-    pub const NUM_DBS: u32 = 15;
+    pub const NUM_DBS: u32 = 17;
+    pub const ACCUMULATOR_SNAPSHOT_INTERVAL: u32 = 144;
 
     pub fn new(env: &sneed::Env) -> Result<Self, Error> {
         let mut rwtxn = env.write_txn()?;
@@ -199,6 +208,8 @@ impl Archive {
         }
         let block_hash_to_height =
             DatabaseUnique::create(env, &mut rwtxn, "hash_to_height")?;
+        let accumulators =
+            DatabaseUnique::create(env, &mut rwtxn, "accumulators")?;
         let bmm_results =
             DatabaseUnique::create(env, &mut rwtxn, "bmm_results")?;
         let bodies = DatabaseUnique::create(env, &mut rwtxn, "bodies")?;
@@ -218,6 +229,8 @@ impl Archive {
             DatabaseUnique::create(env, &mut rwtxn, "main_header_infos")?;
         let main_successors =
             DatabaseUnique::create(env, &mut rwtxn, "main_successors")?;
+        let peg_accumulator_diffs =
+            DatabaseUnique::create(env, &mut rwtxn, "peg_accumulator_diffs")?;
         if main_successors
             .try_get(&rwtxn, &bitcoin::BlockHash::all_zeros())
             .map_err(DbError::from)?
@@ -247,6 +260,7 @@ impl Archive {
         let txdb = DatabaseUnique::create(env, &mut rwtxn, "txdb")?;
         rwtxn.commit()?;
         Ok(Self {
+            accumulators,
             block_hash_to_height,
             bmm_results,
             bodies,
@@ -257,6 +271,7 @@ impl Archive {
             main_block_infos,
             main_header_infos,
             main_successors,
+            peg_accumulator_diffs,
             successors,
             total_work,
             txid_to_inclusions,
@@ -286,6 +301,79 @@ impl Archive {
     ) -> Result<u32, Error> {
         self.try_get_height(rotxn, block_hash)?
             .ok_or(Error::NoHeight(block_hash))
+    }
+
+    pub fn should_snapshot_accumulator(block_height: u32) -> bool {
+        block_height % Self::ACCUMULATOR_SNAPSHOT_INTERVAL == 0
+    }
+
+    pub fn try_get_accumulator(
+        &self,
+        rotxn: &RoTxn,
+        block_hash: BlockHash,
+    ) -> Result<Option<Accumulator>, Error> {
+        self.accumulators
+            .try_get(rotxn, &block_hash)?
+            .map(|bytes| {
+                Accumulator::from_bytes(&bytes).map_err(Error::Utreexo)
+            })
+            .transpose()
+    }
+
+    pub fn get_accumulator(
+        &self,
+        rotxn: &RoTxn,
+        block_hash: BlockHash,
+    ) -> Result<Accumulator, Error> {
+        self.try_get_accumulator(rotxn, block_hash)?
+            .ok_or(Error::NoBlockHash(block_hash))
+    }
+
+    pub fn latest_accumulator_snapshot(
+        &self,
+        rotxn: &RoTxn,
+        tip: BlockHash,
+    ) -> Result<Option<(BlockHash, u32, Accumulator)>, Error> {
+        let mut ancestors = self.ancestors(rotxn, tip);
+        while let Some(block_hash) = ancestors.next()? {
+            if let Some(accumulator) =
+                self.try_get_accumulator(rotxn, block_hash)?
+            {
+                let height = self.get_height(rotxn, block_hash)?;
+                return Ok(Some((block_hash, height, accumulator)));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn put_accumulator_bytes(
+        &self,
+        rwtxn: &mut RwTxn,
+        block_hash: BlockHash,
+        bytes: Vec<u8>,
+    ) -> Result<(), Error> {
+        self.accumulators.put(rwtxn, &block_hash, &bytes)?;
+        Ok(())
+    }
+
+    pub fn try_get_peg_accumulator_diff(
+        &self,
+        rotxn: &RoTxn,
+        block_hash: BlockHash,
+    ) -> Result<Option<AccumulatorDiff>, Error> {
+        Ok(self.peg_accumulator_diffs.try_get(rotxn, &block_hash)?)
+    }
+
+    pub fn put_peg_accumulator_diff(
+        &self,
+        rwtxn: &mut RwTxn,
+        block_hash: BlockHash,
+        diff: &AccumulatorDiff,
+    ) -> Result<(), Error> {
+        if !diff.is_empty() {
+            self.peg_accumulator_diffs.put(rwtxn, &block_hash, diff)?;
+        }
+        Ok(())
     }
 
     pub fn get_bmm_results(

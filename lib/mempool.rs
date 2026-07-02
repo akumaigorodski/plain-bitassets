@@ -196,13 +196,36 @@ impl MemPool {
         Ok(())
     }
 
+    fn delete_one(
+        &self,
+        rwtxn: &mut RwTxn,
+        txid: Txid,
+    ) -> Result<Option<AuthorizedTransaction>, Error> {
+        let Some(tx) = self.transactions.try_get(rwtxn, &txid)? else {
+            return Ok(None);
+        };
+        let () = self.delete_stxos(rwtxn, &tx.transaction.inputs)?;
+        let () = self.unassoc_tx_with_relevant_addresses(rwtxn, &tx)?;
+        self.transactions.delete(rwtxn, &txid)?;
+        Ok(Some(tx))
+    }
+
+    /// Delete a transaction confirmed in a block, but keep mempool
+    /// descendants. Once the confirmed transaction is in chainstate, those
+    /// descendants can be mined without wallet interaction.
+    pub fn delete_confirmed(
+        &self,
+        rwtxn: &mut RwTxn,
+        txid: Txid,
+    ) -> Result<(), Error> {
+        drop(self.delete_one(rwtxn, txid)?);
+        Ok(())
+    }
+
     pub fn delete(&self, rwtxn: &mut RwTxn, txid: Txid) -> Result<(), Error> {
         let mut pending_deletes = VecDeque::from([txid]);
         while let Some(txid) = pending_deletes.pop_front() {
-            if let Some(tx) = self.transactions.try_get(rwtxn, &txid)? {
-                let () = self.delete_stxos(rwtxn, &tx.transaction.inputs)?;
-                let () = self.unassoc_tx_with_relevant_addresses(rwtxn, &tx)?;
-                self.transactions.delete(rwtxn, &txid)?;
+            if let Some(tx) = self.delete_one(rwtxn, txid)? {
                 for vout in 0..tx.transaction.outputs.len() {
                     let outpoint = OutPoint::Regular {
                         txid,

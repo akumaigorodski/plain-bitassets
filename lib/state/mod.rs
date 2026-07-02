@@ -1,4 +1,8 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 use fallible_iterator::FallibleIterator as _;
 use futures::Stream;
@@ -10,12 +14,13 @@ use sneed::{DatabaseUnique, RoDatabaseUnique, RoTxn, RwTxn, UnitKey};
 use crate::{
     authorization::Authorization,
     types::{
-        Address, AddressOutPointKey, AmountOverflowError, Authorized,
-        AuthorizedTransaction, BitAssetId, BlockHash, Body, FilledOutput,
-        FilledTransaction, GetAddress as _, GetBitcoinValue as _, Header,
-        InPoint, M6id, OutPoint, OutPointKey, SpentOutput, Transaction, TxData,
-        VERSION, Verify as _, Version, WithdrawalBundle,
-        WithdrawalBundleStatus, proto::mainchain::TwoWayPegData,
+        AccumulatorDiff, AccumulatorStump, Address, AddressOutPointKey,
+        AmountOverflowError, Authorized, AuthorizedTransaction, BitAssetId,
+        BlockHash, Body, FilledOutput, FilledTransaction, GetAddress as _,
+        GetBitcoinValue as _, Header, InPoint, M6id, OutPoint, OutPointKey,
+        SpentOutput, Transaction, TxData, UtreexoHash, UtreexoProof, VERSION,
+        Verify as _, Version, WithdrawalBundle, WithdrawalBundleStatus,
+        proto::mainchain::TwoWayPegData,
     },
     util::Watchable,
 };
@@ -42,8 +47,8 @@ pub struct PrevalidatedBlock {
     pub filled_transactions: Vec<FilledTransaction>,
     pub computed_merkle_root: crate::types::MerkleRoot,
     pub total_fees: bitcoin::Amount,
-    pub coinbase_value: bitcoin::Amount,
     pub next_height: u32, // Precomputed next height to avoid DB read in write txn
+    pub accumulator_diff: crate::types::AccumulatorDiff,
 }
 
 /// Information we have regarding a withdrawal bundle
@@ -80,6 +85,115 @@ pub struct SpentUtxoEntry {
     pub output: SpentOutput,
 }
 
+#[derive(Default)]
+struct AccumulatorStore(Mutex<AccumulatorState>);
+
+#[derive(Default)]
+struct AccumulatorState {
+    forest: crate::types::Accumulator,
+    stump: AccumulatorStump,
+}
+
+// rustreexo's MemForest is Rc-backed and not Send/Sync. The live forest never
+// leaves this store; all access is serialized through the mutex.
+unsafe impl Send for AccumulatorStore {}
+unsafe impl Sync for AccumulatorStore {}
+
+impl AccumulatorState {
+    fn from_forest(forest: crate::types::Accumulator) -> Self {
+        let stump = forest.stump();
+        Self { forest, stump }
+    }
+
+    fn proof_for(
+        &self,
+        diff: &AccumulatorDiff,
+    ) -> Result<
+        rustreexo::accumulator::proof::Proof<
+            rustreexo::accumulator::node_hash::BitcoinNodeHash,
+        >,
+        String,
+    > {
+        if diff.deletions.is_empty() {
+            Ok(Default::default())
+        } else {
+            self.forest.prove_raw(&diff.deletions)
+        }
+    }
+}
+
+impl AccumulatorStore {
+    fn with_forest<R>(
+        &self,
+        f: impl FnOnce(&crate::types::Accumulator) -> R,
+    ) -> R {
+        let state = self
+            .0
+            .lock()
+            .expect("utreexo accumulator lock should not be poisoned");
+        f(&state.forest)
+    }
+
+    fn replace(&self, accumulator: crate::types::Accumulator) {
+        *self
+            .0
+            .lock()
+            .expect("utreexo accumulator lock should not be poisoned") =
+            AccumulatorState::from_forest(accumulator);
+    }
+
+    fn clear(&self) {
+        self.replace(Default::default());
+    }
+
+    fn roots(&self) -> Vec<UtreexoHash> {
+        self.0
+            .lock()
+            .expect("utreexo accumulator lock should not be poisoned")
+            .stump
+            .roots()
+    }
+
+    fn roots_after_diffs<'a>(
+        &self,
+        diffs: impl IntoIterator<Item = &'a AccumulatorDiff>,
+    ) -> Result<Vec<UtreexoHash>, String> {
+        let state = self
+            .0
+            .lock()
+            .expect("utreexo accumulator lock should not be poisoned");
+        let mut stump = state.stump.clone();
+        for diff in diffs {
+            let proof = state.proof_for(diff)?;
+            stump = stump.next(diff, &proof)?;
+        }
+        Ok(stump.roots())
+    }
+
+    fn apply_diff(
+        &self,
+        diff: &AccumulatorDiff,
+    ) -> Result<Vec<UtreexoHash>, String> {
+        let mut state = self
+            .0
+            .lock()
+            .expect("utreexo accumulator lock should not be poisoned");
+        let proof = state.proof_for(diff)?;
+        let next_stump = state.stump.next(diff, &proof)?;
+        state.forest.apply_diff(diff)?;
+        state.stump = next_stump;
+        Ok(state.stump.roots())
+    }
+
+    fn prove(&self, targets: &[UtreexoHash]) -> Result<UtreexoProof, String> {
+        self.with_forest(|accumulator| accumulator.prove(targets))
+    }
+
+    fn to_bytes(&self) -> Result<Vec<u8>, String> {
+        self.with_forest(|accumulator| accumulator.to_bytes())
+    }
+}
+
 #[derive(Clone)]
 pub struct State {
     /// Current tip
@@ -114,11 +228,13 @@ pub struct State {
         SerdeBincode<u32>,
         SerdeBincode<(bitcoin::BlockHash, u32)>,
     >,
+    utreexo_accumulator: Arc<AccumulatorStore>,
     _version: DatabaseUnique<UnitKey, SerdeBincode<Version>>,
 }
 
 impl State {
     pub const NUM_DBS: u32 = bitassets::Dbs::NUM_DBS + 12 + 1;
+    const ACCUMULATOR_REBUILD_BATCH: usize = 16_384;
 
     pub fn new(env: &sneed::Env) -> Result<Self, Error> {
         let mut rwtxn = env.write_txn()?;
@@ -170,6 +286,7 @@ impl State {
             withdrawal_bundles,
             withdrawal_bundle_event_blocks,
             deposit_blocks,
+            utreexo_accumulator: Arc::new(AccumulatorStore::default()),
             _version: version,
         })
     }
@@ -289,6 +406,177 @@ impl State {
     pub fn try_get_height(&self, rotxn: &RoTxn) -> Result<Option<u32>, Error> {
         let height = self.height.try_get(rotxn, &())?;
         Ok(height)
+    }
+
+    pub fn accumulator_bytes(&self) -> Result<Vec<u8>, Error> {
+        self.utreexo_accumulator.to_bytes().map_err(Error::Utreexo)
+    }
+
+    pub fn set_accumulator(
+        &self,
+        _rwtxn: &mut RwTxn,
+        accumulator: crate::types::Accumulator,
+    ) -> Result<(), Error> {
+        self.utreexo_accumulator.replace(accumulator);
+        Ok(())
+    }
+
+    pub fn delete_accumulator(&self, _rwtxn: &mut RwTxn) -> Result<(), Error> {
+        self.utreexo_accumulator.clear();
+        Ok(())
+    }
+
+    pub fn accumulator_roots(&self) -> Result<Vec<UtreexoHash>, Error> {
+        Ok(self.utreexo_accumulator.roots())
+    }
+
+    #[cfg(test)]
+    pub fn accumulator_roots_after_diff(
+        &self,
+        diff: &AccumulatorDiff,
+    ) -> Result<Vec<UtreexoHash>, Error> {
+        self.accumulator_roots_after_diffs([diff])
+    }
+
+    pub fn accumulator_roots_after_diffs<'a>(
+        &self,
+        diffs: impl IntoIterator<Item = &'a AccumulatorDiff>,
+    ) -> Result<Vec<UtreexoHash>, Error> {
+        let start = Instant::now();
+        let diffs: Vec<_> = diffs.into_iter().collect();
+        let roots = self
+            .utreexo_accumulator
+            .roots_after_diffs(diffs.iter().copied())
+            .map_err(Error::Utreexo)?;
+        let additions: usize =
+            diffs.iter().map(|diff| diff.additions.len()).sum();
+        let deletions: usize =
+            diffs.iter().map(|diff| diff.deletions.len()).sum();
+        tracing::trace!(
+            additions,
+            deletions,
+            elapsed = ?start.elapsed(),
+            "previewed utreexo roots"
+        );
+        Ok(roots)
+    }
+
+    pub fn apply_accumulator_diff(
+        &self,
+        _rwtxn: &mut RwTxn,
+        diff: &AccumulatorDiff,
+    ) -> Result<Vec<UtreexoHash>, Error> {
+        self.apply_accumulator_diff_to_memory(diff)
+    }
+
+    pub(crate) fn apply_accumulator_diff_to_memory(
+        &self,
+        diff: &AccumulatorDiff,
+    ) -> Result<Vec<UtreexoHash>, Error> {
+        if diff.is_empty() {
+            return Ok(self.utreexo_accumulator.roots());
+        }
+        let start = Instant::now();
+        let roots = self
+            .utreexo_accumulator
+            .apply_diff(diff)
+            .map_err(Error::Utreexo)?;
+        tracing::debug!(
+            additions = diff.additions.len(),
+            deletions = diff.deletions.len(),
+            elapsed = ?start.elapsed(),
+            "applied utreexo diff"
+        );
+        Ok(roots)
+    }
+
+    pub fn rebuild_accumulator_from_utxos(
+        &self,
+        rwtxn: &mut RwTxn,
+    ) -> Result<(), Error> {
+        let start = Instant::now();
+        let mut accumulator = crate::types::Accumulator::default();
+        let mut diff = crate::types::AccumulatorDiff::default();
+        let mut n_utxos = 0usize;
+        let mut iter = self.utxos.iter(rwtxn)?;
+        while let Some((outpoint_key, output)) = iter.next()? {
+            let outpoint = outpoint_key.to_outpoint();
+            diff.insert(crate::types::utreexo_leaf_hash(&outpoint, &output));
+            n_utxos += 1;
+            if diff.additions.len() >= Self::ACCUMULATOR_REBUILD_BATCH {
+                accumulator.apply_diff(&diff).map_err(Error::Utreexo)?;
+                diff.clear();
+            }
+        }
+        drop(iter);
+        if !diff.is_empty() {
+            accumulator.apply_diff(&diff).map_err(Error::Utreexo)?;
+        }
+        tracing::warn!(
+            n_utxos,
+            elapsed = ?start.elapsed(),
+            "rebuilt utreexo accumulator from UTXO set"
+        );
+        self.set_accumulator(rwtxn, accumulator)
+    }
+
+    pub fn prove_utxos(
+        &self,
+        rotxn: &RoTxn,
+        outpoints: &[OutPoint],
+    ) -> Result<UtreexoProof, Error> {
+        let mut targets = Vec::with_capacity(outpoints.len());
+        for outpoint in outpoints {
+            let key = OutPointKey::from_outpoint(outpoint);
+            let output =
+                self.utxos.try_get(rotxn, &key)?.ok_or(error::NoUtxo {
+                    outpoint: *outpoint,
+                })?;
+            targets.push(crate::types::utreexo_leaf_hash(outpoint, &output));
+        }
+        let start = Instant::now();
+        let proof = self
+            .utreexo_accumulator
+            .prove(&targets)
+            .map_err(Error::Utreexo)?;
+        tracing::trace!(
+            targets = targets.len(),
+            elapsed = ?start.elapsed(),
+            "built utreexo proof"
+        );
+        Ok(proof)
+    }
+
+    #[cfg(test)]
+    pub fn utreexo_roots_after_body(
+        &self,
+        rotxn: &RoTxn,
+        merkle_root: crate::types::MerkleRoot,
+        body: &Body,
+    ) -> Result<Vec<UtreexoHash>, Error> {
+        block::utreexo_roots_after_body(self, rotxn, merkle_root, body)
+    }
+
+    pub fn accumulator_diff_for_connected_body(
+        &self,
+        rotxn: &RoTxn,
+        merkle_root: crate::types::MerkleRoot,
+        body: &Body,
+    ) -> Result<crate::types::AccumulatorDiff, Error> {
+        block::accumulator_diff_for_connected_body(
+            self,
+            rotxn,
+            merkle_root,
+            body,
+        )
+    }
+
+    pub fn check_accumulator_roots_after_diffs<'a>(
+        &self,
+        expected: &[UtreexoHash],
+        diffs: impl IntoIterator<Item = &'a AccumulatorDiff>,
+    ) -> Result<(), Error> {
+        block::check_accumulator_roots(self, expected, diffs)
     }
 
     pub fn get_utxos(
@@ -799,24 +1087,6 @@ impl State {
         Ok(total_wealth)
     }
 
-    pub fn validate_block(
-        &self,
-        rotxn: &RoTxn,
-        header: &Header,
-        body: &Body,
-    ) -> Result<bitcoin::Amount, Error> {
-        block::validate(self, rotxn, header, body)
-    }
-
-    pub fn connect_block(
-        &self,
-        rwtxn: &mut RwTxn,
-        header: &Header,
-        body: &Body,
-    ) -> Result<(), Error> {
-        block::connect(self, rwtxn, header, body)
-    }
-
     pub fn disconnect_tip(
         &self,
         rwtxn: &mut RwTxn,
@@ -830,7 +1100,7 @@ impl State {
         &self,
         rwtxn: &mut RwTxn,
         two_way_peg_data: &TwoWayPegData,
-    ) -> Result<(), Error> {
+    ) -> Result<AccumulatorDiff, Error> {
         two_way_peg_data::connect(self, rwtxn, two_way_peg_data)
     }
 
@@ -838,7 +1108,7 @@ impl State {
         &self,
         rwtxn: &mut RwTxn,
         two_way_peg_data: &TwoWayPegData,
-    ) -> Result<(), Error> {
+    ) -> Result<AccumulatorDiff, Error> {
         two_way_peg_data::disconnect(self, rwtxn, two_way_peg_data)
     }
 
@@ -856,19 +1126,26 @@ impl State {
         rwtxn: &mut RwTxn,
         header: &Header,
         body: &Body,
-        prevalidated: PrevalidatedBlock,
+        prevalidated: &PrevalidatedBlock,
     ) -> Result<(), Error> {
         block::connect_prevalidated(self, rwtxn, header, body, prevalidated)
     }
 
-    pub fn apply_block(
+    #[cfg(test)]
+    fn apply_block(
         &self,
         rwtxn: &mut RwTxn,
         header: &Header,
         body: &Body,
     ) -> Result<(), Error> {
         let prevalidated = self.prevalidate_block(rwtxn, header, body)?;
-        self.connect_prevalidated_block(rwtxn, header, body, prevalidated)?;
+        block::check_accumulator_roots(
+            self,
+            &header.roots,
+            [&prevalidated.accumulator_diff],
+        )?;
+        self.connect_prevalidated_block(rwtxn, header, body, &prevalidated)?;
+        self.apply_accumulator_diff(rwtxn, &prevalidated.accumulator_diff)?;
         Ok(())
     }
 }

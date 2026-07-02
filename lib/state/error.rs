@@ -7,7 +7,7 @@ use transitive::Transitive;
 
 use crate::types::{
     AmountOverflowError, AmountUnderflowError, AssetId, BitAssetId, BlockHash,
-    Hash, M6id, MerkleRoot, OutPoint, Txid, WithdrawalBundleError,
+    Hash, M6id, MerkleRoot, OutPoint, Txid, UtreexoHash, WithdrawalBundleError,
     transaction::error as transaction,
 };
 
@@ -376,6 +376,13 @@ pub enum Error {
     #[error("invalid header: {0}")]
     InvalidHeader(InvalidHeader),
     #[error(
+        "invalid utreexo roots: expected {expected:?}, computed {computed:?}"
+    )]
+    InvalidUtreexoRoots {
+        expected: Vec<UtreexoHash>,
+        computed: Vec<UtreexoHash>,
+    },
+    #[error(
         "The last output in a BitAsset registration tx must be a control coin"
     )]
     LastOutputNotControlCoin,
@@ -455,6 +462,8 @@ pub enum Error {
         event_block_hash: bitcoin::BlockHash,
         m6id: M6id,
     },
+    #[error("utreexo accumulator error: {0}")]
+    Utreexo(String),
     #[error("utxo double spent")]
     UtxoDoubleSpent,
     #[error(transparent)]
