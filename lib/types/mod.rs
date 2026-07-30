@@ -21,7 +21,7 @@ pub mod proto;
 pub mod schema;
 pub mod transaction;
 
-pub use address::Address;
+pub use address::{ADDRESS_SIZE, Address};
 pub use bitasset_data::{BitAssetData, BitAssetDataUpdates, Update};
 pub use hashes::{
     AssetId, BitAssetId, BlockHash, DutchAuctionId, Hash, M6id, MerkleProof,
@@ -29,8 +29,8 @@ pub use hashes::{
 };
 pub use keys::{EncryptionPubKey, VerifyingKey};
 pub use transaction::{
-    AmmBurn, AmmMint, AmmSwap, AssetOutput, AssetOutputContent, Authorized,
-    AuthorizedTransaction, BitcoinOutput, BitcoinOutputContent,
+    AddressTxidKey, AmmBurn, AmmMint, AmmSwap, AssetOutput, AssetOutputContent,
+    Authorized, AuthorizedTransaction, BitcoinOutput, BitcoinOutputContent,
     DutchAuctionBid, DutchAuctionCollect, DutchAuctionParams, FilledOutput,
     FilledOutputContent, FilledTransaction, InPoint, OutPoint, OutPointKey,
     Output, OutputContent, PointedOutput, SpentOutput, Transaction, TxData,

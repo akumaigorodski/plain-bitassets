@@ -1275,7 +1275,14 @@ mod test {
         };
         {
             let mut rwtxn = env.write_txn()?;
-            state.apply_block(&mut rwtxn, &genesis, &empty_body)?;
+            let prevalidated =
+                state.prevalidate_block(&rwtxn, &genesis, &empty_body)?;
+            state.connect_prevalidated_block(
+                &mut rwtxn,
+                &genesis,
+                &empty_body,
+                prevalidated,
+            )?;
             state.connect_two_way_peg_data(
                 &mut rwtxn,
                 &TwoWayPegData::default(),
@@ -1311,7 +1318,14 @@ mod test {
         };
         {
             let mut rwtxn = env.write_txn()?;
-            state.apply_block(&mut rwtxn, &block1, &empty_body)?;
+            let prevalidated =
+                state.prevalidate_block(&rwtxn, &block1, &empty_body)?;
+            state.connect_prevalidated_block(
+                &mut rwtxn,
+                &block1,
+                &empty_body,
+                prevalidated,
+            )?;
             state.connect_two_way_peg_data(&mut rwtxn, &deposit_twpd)?;
             anyhow::ensure!(
                 state.utxos.try_get(&rwtxn, &deposit_key)?.is_some()

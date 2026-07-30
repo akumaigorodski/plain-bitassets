@@ -456,13 +456,13 @@ where
     })
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MerkleProof {
     pub leaf_index: usize,
     pub siblings: Vec<MerkleProofNode>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub struct MerkleProofNode {
     pub hash: Hash,
     pub is_left: bool,
