@@ -29,12 +29,12 @@ pub use hashes::{
 };
 pub use keys::{EncryptionPubKey, VerifyingKey};
 pub use transaction::{
-    AddressTxidKey, AmmBurn, AmmMint, AmmSwap, AssetOutput, AssetOutputContent,
-    Authorized, AuthorizedTransaction, BitcoinOutput, BitcoinOutputContent,
-    DutchAuctionBid, DutchAuctionCollect, DutchAuctionParams, FilledOutput,
-    FilledOutputContent, FilledTransaction, InPoint, OutPoint, OutPointKey,
-    Output, OutputContent, PointedOutput, SpentOutput, Transaction, TxData,
-    TxInputs, WithdrawalOutputContent,
+    AddressOutPointKey, AddressTxidKey, AmmBurn, AmmMint, AmmSwap, AssetOutput,
+    AssetOutputContent, Authorized, AuthorizedTransaction, BitcoinOutput,
+    BitcoinOutputContent, DutchAuctionBid, DutchAuctionCollect,
+    DutchAuctionParams, FilledOutput, FilledOutputContent, FilledTransaction,
+    InPoint, OutPoint, OutPointKey, Output, OutputContent, PointedOutput,
+    SpentOutput, Transaction, TxData, TxInputs, WithdrawalOutputContent,
 };
 
 pub const THIS_SIDECHAIN: u8 = 4;
