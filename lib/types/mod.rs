@@ -1,6 +1,7 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, HashMap},
+    io,
     sync::LazyLock,
 };
 
@@ -35,6 +36,11 @@ pub use transaction::{
     DutchAuctionParams, FilledOutput, FilledOutputContent, FilledTransaction,
     InPoint, OutPoint, OutPointKey, Output, OutputContent, PointedOutput,
     SpentOutput, Transaction, TxData, TxInputs, WithdrawalOutputContent,
+};
+
+use hashlink::{LinkedHashMap, linked_hash_map::Entry};
+use rustreexo::accumulator::{
+    mem_forest::MemForest, node_hash::AccumulatorHash,
 };
 
 pub const THIS_SIDECHAIN: u8 = 4;
@@ -800,6 +806,240 @@ mod withdrawal_bundle_order_regression {
     }
 }
 
+/// Hash type used by the Utreexo accumulator.
+///
+/// Concrete hashes are BLAKE3 digests. `Placeholder` and `Empty` are internal
+/// rustreexo sentinel values.
+///
+/// The encoding and `parent_hash` algorithm are consensus-critical.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Blake3UtxoHash {
+    Some([u8; 32]),
+    Placeholder,
+    #[default]
+    Empty,
+}
+
+impl Blake3UtxoHash {
+    pub fn hash_bytes(bytes: &[u8]) -> Self {
+        Self::Some(*blake3::hash(bytes).as_bytes())
+    }
+
+    pub fn as_bytes(&self) -> Option<[u8; 32]> {
+        match self {
+            Self::Some(bytes) => Some(*bytes),
+            Self::Placeholder | Self::Empty => None,
+        }
+    }
+}
+
+impl From<blake3::Hash> for Blake3UtxoHash {
+    fn from(hash: blake3::Hash) -> Self {
+        Self::Some(*hash.as_bytes())
+    }
+}
+
+impl From<[u8; 32]> for Blake3UtxoHash {
+    fn from(bytes: [u8; 32]) -> Self {
+        Self::Some(bytes)
+    }
+}
+
+impl std::fmt::Display for Blake3UtxoHash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Some(bytes) => write!(f, "{:?}", bytes),
+            Self::Placeholder => write!(f, "Placeholder"),
+            Self::Empty => write!(f, "Empty"),
+        }
+    }
+}
+
+impl AccumulatorHash for Blake3UtxoHash {
+    fn placeholder() -> Self {
+        Self::Placeholder
+    }
+
+    fn empty() -> Self {
+        Self::Empty
+    }
+
+    fn is_placeholder(&self) -> bool {
+        matches!(self, Self::Placeholder)
+    }
+
+    fn is_empty(&self) -> bool {
+        matches!(self, Self::Empty)
+    }
+
+    fn write<W>(&self, writer: &mut W) -> io::Result<()>
+    where
+        W: io::Write,
+    {
+        match self {
+            Self::Empty => writer.write_all(&[0]),
+            Self::Placeholder => writer.write_all(&[1]),
+            Self::Some(bytes) => {
+                writer.write_all(&[2])?;
+                writer.write_all(bytes)
+            }
+        }
+    }
+
+    fn read<R>(reader: &mut R) -> io::Result<Self>
+    where
+        R: io::Read,
+    {
+        let mut tag = [0];
+        reader.read_exact(&mut tag)?;
+
+        match tag {
+            [0] => Ok(Self::Empty),
+            [1] => Ok(Self::Placeholder),
+            [2] => {
+                let mut bytes = [0u8; 32];
+                reader.read_exact(&mut bytes)?;
+                Ok(Self::Some(bytes))
+            }
+            [_] => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected tag for Blake3UtxoHash",
+            )),
+        }
+    }
+
+    fn parent_hash(left: &Self, right: &Self) -> Self {
+        let (Self::Some(left), Self::Some(right)) = (left, right) else {
+            unreachable!("parent_hash called with non-concrete hash");
+        };
+
+        let mut input = [0u8; 64];
+        input[..32].copy_from_slice(left);
+        input[32..].copy_from_slice(right);
+
+        Self::Some(*blake3::hash(&input).as_bytes())
+    }
+}
+
+/// Hash a UTXO into the canonical leaf committed to by the accumulator.
+pub fn utreexo_leaf_hash(outpoint: &OutPoint, output: &FilledOutput) -> Hash {
+    hashes::hash_with_scratch_buffer(&PointedOutput {
+        outpoint: *outpoint,
+        output: output.clone(),
+    })
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AccumulatorDiff {
+    /// `true` means insertion; `false` means deletion.
+    diff: LinkedHashMap<[u8; 32], bool>,
+    insertions: usize,
+    deletions: usize,
+}
+
+impl AccumulatorDiff {
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            diff: LinkedHashMap::with_capacity(capacity),
+            insertions: 0,
+            deletions: 0,
+        }
+    }
+
+    pub fn insert(&mut self, utxo_hash: [u8; 32]) {
+        match self.diff.entry(utxo_hash) {
+            Entry::Occupied(entry) => {
+                if !entry.get() {
+                    entry.remove();
+                    debug_assert!(self.deletions > 0);
+                    self.deletions -= 1;
+                }
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(true);
+                self.insertions += 1;
+            }
+        }
+    }
+
+    pub fn remove(&mut self, utxo_hash: [u8; 32]) {
+        match self.diff.entry(utxo_hash) {
+            Entry::Occupied(entry) => {
+                if *entry.get() {
+                    entry.remove();
+                    debug_assert!(self.insertions > 0);
+                    self.insertions -= 1;
+                }
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(false);
+                self.deletions += 1;
+            }
+        }
+    }
+}
+
+impl Serialize for AccumulatorDiff {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut insertions = Vec::with_capacity(self.insertions);
+        let mut deletions = Vec::with_capacity(self.deletions);
+
+        for (hash, insert) in &self.diff {
+            if *insert {
+                insertions.push(*hash);
+            } else {
+                deletions.push(*hash);
+            }
+        }
+
+        serde::Serialize::serialize(&(insertions, deletions), serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for AccumulatorDiff {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let (insertions, deletions): (Vec<[u8; 32]>, Vec<[u8; 32]>) =
+            Deserialize::deserialize(deserializer)?;
+
+        let mut diff = Self::with_capacity(insertions.len() + deletions.len());
+
+        for hash in insertions {
+            diff.insert(hash);
+        }
+
+        for hash in deletions {
+            diff.remove(hash);
+        }
+
+        Ok(diff)
+    }
+}
+
+#[derive(Default)]
+#[repr(transparent)]
+pub struct Accumulator(pub MemForest<Blake3UtxoHash>);
+
+impl Accumulator {
+    pub fn serialize_into<W: io::Write>(
+        &self,
+        writer: &mut W,
+    ) -> Result<(), String> {
+        self.0.serialize(writer).map_err(|err| err.to_string())
+    }
+
+    pub fn deserialize_from(bytes: &[u8]) -> Result<Self, String> {
+        MemForest::deserialize(bytes)
+            .map(Self)
+            .map_err(|err| err.to_string())
+    }
+}
+
 #[cfg(test)]
 mod merkle_tests {
     use super::*;
@@ -845,5 +1085,91 @@ mod merkle_tests {
         let leaf = hashes::hash_with_scratch_buffer(&txs[1]);
 
         assert!(!proof.verify(leaf, root));
+    }
+}
+
+#[cfg(test)]
+mod utreexo_hash_tests {
+    use rustreexo::accumulator::node_hash::AccumulatorHash as _;
+
+    use super::{
+        Accumulator, AccumulatorDiff, Address, Blake3UtxoHash, FilledOutput,
+        FilledOutputContent, OutPoint, utreexo_leaf_hash,
+    };
+
+    #[test]
+    fn accumulator_hash_tags_roundtrip_distinct_sentinels() {
+        for expected in [
+            Blake3UtxoHash::Empty,
+            Blake3UtxoHash::Placeholder,
+            Blake3UtxoHash::Some([0; 32]),
+            Blake3UtxoHash::Some([42; 32]),
+        ] {
+            let mut bytes = Vec::new();
+            expected.write(&mut bytes).unwrap();
+
+            let actual = Blake3UtxoHash::read(&mut &*bytes).unwrap();
+
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn accumulator_parent_hash_golden_vector() {
+        let parent = Blake3UtxoHash::parent_hash(
+            &Blake3UtxoHash::Some([1; 32]),
+            &Blake3UtxoHash::Some([2; 32]),
+        );
+
+        assert_eq!(
+            hex::encode(parent.as_bytes().unwrap()),
+            "8d67bc7836d128b108be2c965538f37bbcee3e7503e35e58fbb0446432e05206"
+        );
+    }
+
+    #[test]
+    fn accumulator_storage_formats_roundtrip() {
+        let mut expected_diff = AccumulatorDiff::default();
+        expected_diff.insert([1; 32]);
+        expected_diff.remove([2; 32]);
+
+        let encoded_diff = bincode::serialize(&expected_diff).unwrap();
+        let decoded_diff: AccumulatorDiff =
+            bincode::deserialize(&encoded_diff).unwrap();
+        assert_eq!(decoded_diff, expected_diff);
+
+        let expected_accumulator = Accumulator::default();
+        let mut encoded_accumulator = Vec::new();
+        expected_accumulator
+            .serialize_into(&mut encoded_accumulator)
+            .unwrap();
+
+        let decoded_accumulator =
+            Accumulator::deserialize_from(&encoded_accumulator).unwrap();
+        let mut reencoded_accumulator = Vec::new();
+        decoded_accumulator
+            .serialize_into(&mut reencoded_accumulator)
+            .unwrap();
+        assert_eq!(reencoded_accumulator, encoded_accumulator);
+    }
+
+    #[test]
+    fn utreexo_leaf_hash_golden_vector() {
+        let outpoint = OutPoint::Regular {
+            txid: [1; 32].into(),
+            vout: 7,
+        };
+        let output = FilledOutput {
+            address: Address::ALL_ZEROS,
+            content: FilledOutputContent::new_bitcoin_value(
+                bitcoin::Amount::from_sat(42),
+            ),
+            memo: b"utreexo".to_vec(),
+        };
+
+        assert_eq!(
+            hex::encode(utreexo_leaf_hash(&outpoint, &output)),
+            "3d6f84894a0d7586c1fdc5c7f42f3268aedef0f14a97633241bab06c66ccbb19"
+        );
     }
 }
